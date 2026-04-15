@@ -9,7 +9,9 @@
   "enable_tpu": false,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["sani84/isic-2018-classification"],
+  "dataset_sources": [
+    "yehiasamir/isic2018-dataset"
+  ],
   "competition_sources": [],
   "kernel_sources": []
 }

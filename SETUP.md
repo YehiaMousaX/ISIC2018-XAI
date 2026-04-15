@@ -1,99 +1,86 @@
-# One-Time Setup
-
-Run these steps once after cloning. Then use `bash scripts/run.sh` every day.
+# Setup Guide
 
 ---
 
-## 1. Kaggle CLI
+## 1. Upload your data to Kaggle (one-time)
+
+Go to **kaggle.com/datasets** → **New Dataset** and upload your `Data.zip`.
+
+- Give it the title **`isic2018-dataset`** — this sets the slug to `yehiasamir/isic2018-dataset`.
+- If you use a different title, open `XAI_Evaluation_Pipeline_Kaggle.ipynb` → cell **A.1** and update `KAGGLE_DATASET_SLUG` to match.
+
+The notebook auto-detects whether your zip extracted with or without a `Data/` wrapper,
+so either zip structure works.
+
+---
+
+## 2. Install the Kaggle CLI
 
 ```bash
 pip install kaggle
-# Place your kaggle.json at ~/.kaggle/kaggle.json  (never commit this)
-chmod 600 ~/.kaggle/kaggle.json
-kaggle config view
 ```
 
-## 2. Configure the ISIC pipeline
+Place your API token at `~/.kaggle/kaggle.json` (download from kaggle.com → Settings → API):
 
-Create your local config file and edit it:
+```bash
+chmod 600 ~/.kaggle/kaggle.json
+kaggle config view   # should print your username
+```
+
+---
+
+## 3. Create your local config
 
 ```bash
 cp scripts/pipeline.env.example scripts/pipeline.env
 ```
 
-Update at least these fields in `scripts/pipeline.env`:
-
-- `KAGGLE_USER`
-- `KERNEL_SLUG`
-- `KERNEL_ID`
-- `NOTEBOOK`
-- `DATASET_SOURCES` (must include your ISIC images dataset slug)
-
-Example:
-
-```bash
-KAGGLE_USER=yehiasamir
-KERNEL_SLUG=isic2018-xai-evaluation
-KERNEL_ID=yehiasamir/isic2018-xai-evaluation
-NOTEBOOK=XAI_Evaluation_Pipeline_Kaggle.ipynb
-DATASET_SOURCES=sani84/isic-2018-classification,yehiasamir/isic2018-prepared,yehiasamir/timm-pretrained-weights
-```
-
-## 3. Create the Kaggle kernel (first time only)
-
-Push the notebook to create the kernel entry on Kaggle:
-
-```bash
-bash scripts/push_to_kaggle.sh
-```
-
-If the kernel doesn't exist, Kaggle creates it. If it exists, it's updated.
-
-## 4. Make scripts executable (Git Bash)
-
-```bash
-chmod +x scripts/*.sh
-```
-
-## 5. Run local notebooks first
-
-Before doing any Kaggle run, complete the local workflow:
-1. Open and run `EDA.ipynb` to explore the dataset
-2. Run your preprocessing/split notebook to generate `prepared/*.csv`
-3. Verify `prepared/` has split files and metadata required by the training notebook
-
-## 6. Add prepared/ as a Kaggle dataset (if not already done)
-
-The `prepared/` CSVs must be available to the Kaggle kernel as a dataset source.
-Upload them once:
-```bash
-# Create dataset metadata
-kaggle datasets init -p prepared/
-# Edit prepared/dataset-metadata.json with your username and slug
-kaggle datasets create -p prepared/
-```
-Then add the slug to `DATASET_SOURCES` in `scripts/pipeline.env`.
+The defaults already match your setup (`yehiasamir`, `isic2018-xai-evaluation`).
+No edits needed unless you renamed something.
 
 ---
 
-## Daily Loop
+## 4. Push the notebook to Kaggle (first time)
 
-| Step | Command |
-|---|---|
-| Edit notebook | — |
-| Full cycle | `bash scripts/run.sh "note"` or `.\run.ps1 "note"` |
-| Push only | `make push` |
-| Check status only | `make status` |
-| Wait for run | `make wait` |
-| Pull results | `make pull` |
-| Capture error | `make log-error` |
-| Compare all runs | `bash scripts/compare.sh` |
+```bash
+chmod +x scripts/*.sh
+bash scripts/push_to_kaggle.sh
+```
 
-## Handing an Error to Claude
+This creates the kernel on Kaggle and attaches `yehiasamir/isic2018-dataset` as the data source.
 
-1. Run fails → `errors/latest_error.txt` is auto-written.
+---
+
+## 5. Run
+
+```bash
+bash scripts/run.sh "initial run"
+# or on Windows PowerShell:
+.\run.ps1 "initial run"
+```
+
+This commits any local changes, pushes to GitHub, pushes the notebook to Kaggle, and starts the kernel run.
+
+---
+
+## Daily workflow
+
+| Action | Command |
+|--------|---------|
+| Full cycle (commit → push → Kaggle run) | `bash scripts/run.sh "message"` or `.\run.ps1 "message"` |
+| Push notebook only | `make push` |
+| Check Kaggle run status | `make status` |
+| Wait for run to finish | `make wait` |
+| Pull output files | `make pull` |
+| Capture error log | `make log-error` |
+
+---
+
+## Handing an error to Claude
+
+1. Run fails → `errors/latest_error.txt` is written automatically.
 2. Tell Claude:
 
    > "New error in `errors/latest_error.txt`. Please read it and fix the notebook."
 
-3. Claude reads both files, patches the notebook, commits.
+3. Claude reads the error, patches the notebook, commits.
