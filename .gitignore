@@ -1,0 +1,22 @@
+# ── Dataset (uploaded separately to Kaggle) ──────────────────────────────────
+Data/
+Data.zip
+dataset_preparation.txt
+
+# ── Generated outputs (reproducible from the notebook) ───────────────────────
+outputs/
+prepared/
+__pycache__/
+*.pyc
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/
+
+# ── Local config (keep only .example) ────────────────────────────────────────
+scripts/pipeline.env
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/

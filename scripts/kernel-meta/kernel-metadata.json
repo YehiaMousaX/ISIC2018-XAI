@@ -1,0 +1,15 @@
+{
+  "id": "yehiasamir/isic2018-xai-evaluation",
+  "title": "ISIC2018 XAI Evaluation Pipeline",
+  "code_file": "../../XAI_Evaluation_Pipeline_Kaggle.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": ["sani84/isic-2018-classification"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
