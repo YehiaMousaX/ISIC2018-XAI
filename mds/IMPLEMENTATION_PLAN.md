@@ -55,8 +55,18 @@ Data/
                                #   *_attribute_streaks.png
 ```
 
-### Plausibility subset note
-The 3,694 masks in `plausibility/masks/` are drawn from the broader ISIC pool (not strictly train-only). During Phase E, we intersect the test split image IDs with available mask filenames to identify evaluable samples.
+### Two disjoint image populations — critical architectural fact
+
+ISIC 2018 contains **two completely separate image sets** with non-overlapping IDs:
+
+| Population | ID range | Location | Labels? | Masks? |
+|---|---|---|---|---|
+| Task 3 classification | ISIC_0024306 – ISIC_0035528 | `images/train\|val\|test/` | yes (CSV) | **no** |
+| Task 1 segmentation | ISIC_0000000 – ISIC_0003693 | `plausibility/images/` | not in CSVs | **yes** |
+
+**Consequence:** `has_mask` on `train_df` / `val_df` / `test_df` is always `False` — by design, not a bug.
+
+Phase E (Plausibility) does **not** draw from `eval_subsets`. It uses a separate `plaus_df` built in Step A.4 from `Data/plausibility/images/` paired with their masks. Each trained model is run on `plaus_df` at inference time to obtain predictions and heatmaps, which are then compared against the ground-truth masks.
 
 ### Attribute masks note
 The 5 attribute maps (globules, milia-like cysts, negative network, pigment network, streaks) are dermoscopic structural features. These can be used in Phase E for fine-grained plausibility analysis beyond binary lesion boundary IoU.
@@ -238,52 +248,77 @@ print(f"\nConfirmation type dist (train):\n{train_df['diagnosis_confirm_type'].v
 
 #### Step A.4 — Build Plausibility Index
 
-**Goal:** Index available masks and attribute maps from `Data/plausibility/`. Attach `has_mask` + `mask_path` to the test DataFrame. Report how many test images have masks.
+**Goal:** Index masks and attribute maps from `Data/plausibility/`. Build `plaus_df` — the dedicated DataFrame used by Phase E. Do **not** attach `has_mask` to train/val/test (those splits have no masks).
 
 ```python
+PLAUS_IMG_DIR = os.path.join(DATA_ROOT, "plausibility", "images")
+
+# mask_index  : image_id → absolute path to *_segmentation.png
 mask_index = {
     f.stem.replace("_segmentation", ""): str(f)
     for f in Path(MASK_DIR).glob("*_segmentation.png")
-}
-attr_index = {}  # image_id -> {attr_type: path}
-for f in Path(ATTR_DIR).glob("*.png"):
-    for attr in ATTR_TYPES:
-        if f.stem.endswith(f"_attribute_{attr}"):
-            img_id = f.stem.replace(f"_attribute_{attr}", "")
-            attr_index.setdefault(img_id, {})[attr] = str(f)
+} if Path(MASK_DIR).exists() else {}
 
-for df in [train_df, val_df, test_df]:
-    df["has_mask"]  = df["image_id"].isin(mask_index)
-    df["mask_path"] = df["image_id"].map(lambda x: mask_index.get(x))
+# attr_index  : image_id → {attr_type: path}
+attr_index = {}
+if Path(ATTR_DIR).exists():
+    for f in Path(ATTR_DIR).glob("*.png"):
+        for attr in ATTR_TYPES:
+            if f.stem.endswith(f"_attribute_{attr}"):
+                img_id = f.stem.replace(f"_attribute_{attr}", "")
+                attr_index.setdefault(img_id, {})[attr] = str(f)
 
-# ── Lesion area fraction & size group (EDA §G — critical for plausibility stratification) ──
-# EDA finding: 19.1% of masked images have lesion area < 5% of image.
-# A correctly centred heatmap on a tiny lesion still scores near-zero IoU —
-# this is a metric property, not a model failure. Must be reported separately.
+# Build plaus_df: one row per plausibility image that has a mask on disk.
+# Labels are looked up from train/val/test CSVs where available; "unknown" otherwise.
+_all_labels = pd.concat([
+    train_df[["image_id","label_idx","label_name"]],
+    val_df  [["image_id","label_idx","label_name"]],
+    test_df [["image_id","label_idx","label_name"]],
+], ignore_index=True).drop_duplicates("image_id")
+
+plaus_records = []
+for img_id, mask_path in mask_index.items():
+    img_path = os.path.join(PLAUS_IMG_DIR, f"{img_id}.jpg")
+    if not os.path.exists(img_path):
+        continue
+    row = {"image_id": img_id, "img_path": img_path, "mask_path": mask_path}
+    match = _all_labels[_all_labels["image_id"] == img_id]
+    row["label_idx"]  = int(match.iloc[0]["label_idx"]) if len(match) else -1
+    row["label_name"] = match.iloc[0]["label_name"]     if len(match) else "unknown"
+    plaus_records.append(row)
+plaus_df = pd.DataFrame(plaus_records)
+
+# Lesion area fraction & size group — computed on plaus_df only.
+# EDA finding: 19.1% of masked images have lesion area < 5% of image area.
+# A correctly centred heatmap on a tiny lesion scores near-zero IoU regardless of
+# method quality — metric artefact, not XAI failure. Phase E stratifies by size group.
 def compute_lesion_area_fraction(mask_path, target_size=(IMG_SIZE, IMG_SIZE)):
-    """Return the fraction of image pixels that are lesion (0.0–1.0)."""
     if not mask_path or not os.path.exists(mask_path):
-        return np.nan
+        return float("nan")
     mask = np.array(Image.open(mask_path).convert("L").resize(target_size))
     return (mask > 127).sum() / (target_size[0] * target_size[1])
 
-for df in [train_df, val_df, test_df]:
-    df["lesion_area_frac"] = df["mask_path"].map(compute_lesion_area_fraction)
-    df["lesion_size_group"] = df["lesion_area_frac"].map(
-        lambda x: "small" if (not np.isnan(x) and x < 0.05) else
-                  ("standard" if (not np.isnan(x) and x >= 0.05) else np.nan)
-    )
+plaus_df["lesion_area_frac"]  = plaus_df["mask_path"].map(compute_lesion_area_fraction)
+plaus_df["lesion_size_group"] = plaus_df["lesion_area_frac"].map(
+    lambda x: "small"    if (x == x and x < 0.05)  else
+              "standard" if (x == x and x >= 0.05) else float("nan")
+)
 
-small_n = (test_df["lesion_size_group"] == "small").sum()
-std_n   = (test_df["lesion_size_group"] == "standard").sum()
-print(f"Total masks available : {len(mask_index)}")
-print(f"Test images with mask : {test_df['has_mask'].sum()} / {len(test_df)}")
-print(f"  small lesions (<5%) : {small_n} ({small_n/(small_n+std_n)*100:.1f}%)")
-print(f"  standard lesions    : {std_n}")
-print(f"Attribute map images  : {len(attr_index)}")
+small_n = (plaus_df["lesion_size_group"] == "small").sum()
+std_n   = (plaus_df["lesion_size_group"] == "standard").sum()
+denom   = small_n + std_n if (small_n + std_n) > 0 else 1
+
+print(f"Total masks available        : {len(mask_index)}")
+print(f"Plausibility images on disk  : {len(plaus_df)}")
+print(f"  small lesions  (<5%)       : {small_n}  ({small_n/denom*100:.1f}%)")
+print(f"  standard lesions           : {std_n}")
+print(f"Attribute map images         : {len(attr_index)}")
+print()
+print("NOTE: train/val/test splits share NO image IDs with plaus_df.")
+print("      Phase E runs exclusively on plaus_df.")
 ```
 
-**Validation:** ~3,694 masks total. Some portion overlap with the test split (used in Phase E).
+**Validation:** `plaus_df` has ~3,694 rows. `train_df`/`val_df`/`test_df` have no `has_mask` column (intentional). Small-lesion fraction ~19%.
 
 ---
 
@@ -680,13 +715,14 @@ for arch_key in ARCHITECTURES:
     eval_subsets[arch_key] = correct_df
 
     n_correct = correct_mask.sum()
-    n_with_seg = correct_df["has_mask"].sum()
     print(f"{arch_key}: {n_correct}/{len(test_df)} correct "
-          f"({n_correct/len(test_df)*100:.1f}%), "
-          f"{n_with_seg} with segmentation masks")
+          f"({n_correct/len(test_df)*100:.1f}%)"
+          f"  [plausibility evaluated separately on plaus_df in Phase E]")
 ```
 
-**Validation:** Each model's correct subset size printed. The subset with masks is used for plausibility; the full correct subset for faithfulness/robustness/complexity.
+**Validation:** Each model's correct subset size printed.
+- **Faithfulness, Robustness, Complexity** → `eval_subsets[arch_key]` (correctly classified test images)
+- **Plausibility** → `plaus_df` (separate population in `plausibility/images/`; has masks; no overlap with test split)
 
 ---
 
@@ -1182,7 +1218,16 @@ def compute_insertion_deletion(model, img_tensor, heatmap, target_class,
 
 > Maps to: **Thesis §5.4.2 (Dimension 2)**
 
-> **EDA note (§G):** 19.1% of masked images have a lesion covering < 5% of the image. For tiny lesions any spatial offset in the heatmap produces near-zero IoU regardless of method quality — this is a metric property, not an XAI failure. All plausibility results **must** be stratified by `lesion_size_group` ("small" < 5%, "standard" ≥ 5%) and reported separately before pooling. The `lesion_size_group` column is computed in Step A.4.
+> **Data source:** Phase E runs exclusively on `plaus_df` — the 3,694 images in `Data/plausibility/images/` paired with their ground-truth segmentation masks. These images have different IDs from the train/val/test classification splits and are never seen by the model during training.
+>
+> **No classification label is needed.** Plausibility evaluation asks: *"Does the XAI heatmap highlight the lesion region?"* — not *"Did the model predict the right class?"* The workflow is:
+> 1. Run model on plausibility image → get **predicted class** (whatever the model commits to)
+> 2. Generate XAI heatmap **for that predicted class**
+> 3. Measure overlap of heatmap with **ground-truth mask** via IoU / Dice / Pointing Game
+>
+> The mask defines *where* the lesion is. A good XAI method should focus on that region regardless of which disease the model predicted. This is standard practice in the XAI literature (GradCAM, RISE, etc.) and does not require a correct or even known classification label.
+>
+> **EDA note (§G):** 19.1% of masked images have a lesion covering < 5% of the image. For tiny lesions any spatial offset in the heatmap produces near-zero IoU regardless of method quality — this is a metric property, not an XAI failure. All plausibility results **must** be stratified by `lesion_size_group` ("small" < 5%, "standard" ≥ 5%) and reported separately before pooling. The `lesion_size_group` column is computed on `plaus_df` in Step A.4.
 >
 > **L2 attribute coverage note (§G):** Pigment network (n = 1,950, 52.8% non-empty) is the only attribute with sufficient N for reliable per-class breakdowns. Streaks (n = 152) and negative network (n = 244) should be treated as exploratory with confidence intervals, or aggregated into an "other" group.
 
@@ -1300,94 +1345,103 @@ def compute_entropy(heatmap):
 
 #### Step G.1 — Run Full Evaluation Loop
 
-**Goal:** For every (model × applicable XAI method) cell, compute all metrics on the test set. Store results in a structured DataFrame.
+**Goal:** Two separate loops over the same (model × method) grid:
+
+1. **Faithfulness + Robustness + Complexity** — run on `eval_subsets[arch_key]` (correctly classified test images).
+2. **Plausibility** — run on `plaus_df` (the 3,694 images in `plausibility/images/` with ground-truth masks).
+
+Results are merged by `(arch, method, image_id)` into a single `results_df`.
 
 ```python
 from tqdm.auto import tqdm
 
-all_results = []  # list of dicts, one per (model, method, image)
+faith_results = []   # faithfulness / robustness / complexity rows
+plaus_results = []   # plausibility rows
 
 for arch_key in ARCHITECTURES:
     model = trained_models[arch_key].to(DEVICE).eval()
     methods = get_applicable_methods(arch_key)
-    eval_df = eval_subsets[arch_key]
 
-    # In DEBUG mode, limit to 20 images
+    # ── Loop 1: Faithfulness / Robustness / Complexity ─────────────────────
+    eval_df = eval_subsets[arch_key]
     if DEBUG:
         eval_df = eval_df.head(20)
 
     for method in methods:
-        print(f"\n▶ {arch_key} × {method} ({len(eval_df)} images)")
+        print(f"\n▶ [Faith/Rob/Cplx] {arch_key} × {method} ({len(eval_df)} images)")
+        for _, row in tqdm(eval_df.iterrows(), total=len(eval_df)):
+            img = apply_color_constancy(np.array(
+                Image.open(os.path.join(TEST_IMG, f"{row['image_id']}.jpg")).convert("RGB")
+            ))
+            img_tensor = eval_transform(image=img)["image"].unsqueeze(0).to(DEVICE)
+            target_class = int(row["pred"])
 
-        for idx, row in tqdm(eval_df.iterrows(), total=len(eval_df)):
-            # Load image
-            img_path = os.path.join(IMG_DIR, f"{row['image_id']}.jpg")
-            img = np.array(Image.open(img_path).convert("RGB"))
-            transformed = eval_transform(image=img)
-            img_tensor = transformed["image"].unsqueeze(0).to(DEVICE)
+            heatmap = generate_heatmap(model, img_tensor, method, arch_key, target_class)
 
-            target_class = row["pred"]
-
-            # Generate heatmap
-            heatmap = generate_heatmap(model, img_tensor, method,
-                                        arch_key, target_class)
-
-            result = {
-                "arch": arch_key,
-                "method": method,
-                "image_id": row["image_id"],
-                "label": row["label_idx"],
-                "label_name": row["label_name"],
-                # EDA §G: size group for plausibility stratification
-                "lesion_size_group": row.get("lesion_size_group", np.nan),
-                # EDA §C: label quality for Phase H.3 sensitivity analysis
-                "confirm_type": row.get("diagnosis_confirm_type", np.nan),
-            }
-
-            # ── Faithfulness ──
             aopc, _ = compute_aopc(model, img_tensor, heatmap, target_class)
-            ins_auc, del_auc = compute_insertion_deletion(model, img_tensor,
-                                                          heatmap, target_class)
-            result["aopc"] = aopc
-            result["insertion_auc"] = ins_auc
-            result["deletion_auc"] = del_auc
-
-            # ── Plausibility (only if mask available) ──
-            if row.get("has_mask", False) and row["mask_path"]:
-                gt_mask = np.array(Image.open(row["mask_path"]).convert("L"))
-                gt_mask = (gt_mask > 127).astype(np.float32)
-                plaus = compute_plausibility(heatmap, gt_mask)
-                result.update(plaus)
-            else:
-                for t in BINARIZE_THRESHOLDS:
-                    result[f"iou_{t}"] = np.nan
-                    result[f"dice_{t}"] = np.nan
-                result["pointing_game"] = np.nan
-
-            # ── Robustness ──
-            max_sens = compute_max_sensitivity(
-                model, img_tensor, method, arch_key,
-                target_class, heatmap
+            ins_auc, del_auc = compute_insertion_deletion(
+                model, img_tensor, heatmap, target_class
             )
-            result["max_sensitivity"] = max_sens
+            max_sens = compute_max_sensitivity(
+                model, img_tensor, method, arch_key, target_class, heatmap
+            )
+            faith_results.append({
+                "arch": arch_key, "method": method,
+                "image_id": row["image_id"],
+                "label": row["label_idx"], "label_name": row["label_name"],
+                "confirm_type": row.get("diagnosis_confirm_type", np.nan),
+                "aopc": aopc, "insertion_auc": ins_auc, "deletion_auc": del_auc,
+                "max_sensitivity": max_sens,
+                "entropy": compute_entropy(heatmap),
+            })
 
-            # ── Complexity ──
-            result["entropy"] = compute_entropy(heatmap)
+    # ── Loop 2: Plausibility ────────────────────────────────────────────────
+    plaus_eval = plaus_df.copy()
+    if DEBUG:
+        plaus_eval = plaus_eval.head(20)
 
-            all_results.append(result)
+    for method in methods:
+        print(f"\n▶ [Plausibility]    {arch_key} × {method} ({len(plaus_eval)} images)")
+        for _, row in tqdm(plaus_eval.iterrows(), total=len(plaus_eval)):
+            img = apply_color_constancy(np.array(
+                Image.open(row["img_path"]).convert("RGB")
+            ))
+            img_tensor = eval_transform(image=img)["image"].unsqueeze(0).to(DEVICE)
+            # Use model's predicted class (not ground-truth label) for the heatmap
+            with torch.no_grad():
+                target_class = model(img_tensor).argmax(1).item()
+
+            heatmap = generate_heatmap(model, img_tensor, method, arch_key, target_class)
+
+            gt_mask = (np.array(Image.open(row["mask_path"]).convert("L")) > 127).astype(np.float32)
+            plaus = compute_plausibility(heatmap, gt_mask)
+            plaus_results.append({
+                "arch": arch_key, "method": method,
+                "image_id": row["image_id"],
+                "label": row["label_idx"], "label_name": row["label_name"],
+                "lesion_size_group": row["lesion_size_group"],
+                **plaus,
+            })
 
     model = model.cpu()
     torch.cuda.empty_cache()
 
-results_df = pd.DataFrame(all_results)
+faith_df = pd.DataFrame(faith_results)
+plaus_df_results = pd.DataFrame(plaus_results)
+
+# Merge on (arch, method, image_id) — NaN where an image appears in only one loop
+results_df = faith_df.merge(
+    plaus_df_results, on=["arch", "method", "image_id", "label", "label_name"],
+    how="outer"
+)
 results_df.to_csv(os.path.join(OUT_ROOT, "full_results.csv"), index=False)
 print(f"\n✓ Full results: {results_df.shape}")
 print(results_df.head())
 ```
 
-**Validation:** DataFrame has columns for all metrics. No NaN in faithfulness columns. Plausibility columns have NaN only where masks are absent.
+**Validation:** `faith_df` has no NaN in `aopc`/`insertion_auc`/`deletion_auc`. `plaus_df_results` has no NaN in `iou_*`/`dice_*`/`pointing_game`. After merge, plausibility columns are NaN for test-set rows (expected).
 
-**⚠️ Runtime note:** This is the longest cell. In DEBUG mode (~20 images × 16 cells) it takes ~10 min. Full run (~1500 images × 16 cells) takes ~6–10 hours on a T4. Plan accordingly.
+**⚠️ Runtime note:** This is the longest step. Full run (~1,500 eval images + ~3,700 plaus images, × 16 method-cells) takes ~8–12 hours on a T4. Plan accordingly.
 
 ---
 
@@ -1427,7 +1481,7 @@ print("\n── Plausibility by lesion size group ──")
 print(size_summary.to_string())
 ```
 
-**Validation:** Main table has 16 rows (4 models × 4 methods each). Size-stratified table has up to 32 rows (× 2 size groups). Small-lesion IoU/Dice values should be noticeably lower than standard-lesion values — if not, re-check the `lesion_size_group` computation in A.4.
+**Validation:** Main faithfulness table has 16 rows (4 models × 4 methods each); plausibility columns from `plaus_df_results` will be NaN for any row that has no plausibility counterpart. Size-stratified plausibility table has up to 32 rows (16 × 2 size groups). Small-lesion IoU/Dice values should be noticeably lower than standard-lesion values — if not, re-check the `lesion_size_group` computation in A.4.
 
 ---
 
@@ -1580,29 +1634,26 @@ print(sig_df.to_string())
 ```python
 sweep_thresholds = np.arange(0.1, 1.0, 0.1)
 
-# Run on a subset of mask-available images
+# Threshold sweep runs on plaus_df — the only population with ground-truth masks.
 sweep_results = []
 for arch_key in ARCHITECTURES:
     model = trained_models[arch_key].to(DEVICE).eval()
     methods = get_applicable_methods(arch_key)
-    mask_df = eval_subsets[arch_key][eval_subsets[arch_key]["has_mask"]].head(
-        50 if not DEBUG else 10
-    )
+    sweep_sample = plaus_df.head(50 if not DEBUG else 10)
 
     for method in methods:
-        for _, row in mask_df.iterrows():
-            img = np.array(Image.open(
-                os.path.join(IMG_DIR, f"{row['image_id']}.jpg")
-            ).convert("RGB"))
-            transformed = eval_transform(image=img)
-            img_tensor = transformed["image"].unsqueeze(0).to(DEVICE)
-            heatmap = generate_heatmap(model, img_tensor, method,
-                                        arch_key, row["pred"])
-            gt_mask = np.array(Image.open(row["mask_path"]).convert("L"))
-            gt_mask = (gt_mask > 127).astype(np.float32)
+        for _, row in sweep_sample.iterrows():
+            img = apply_color_constancy(np.array(
+                Image.open(row["img_path"]).convert("RGB")
+            ))
+            img_tensor = eval_transform(image=img)["image"].unsqueeze(0).to(DEVICE)
+            with torch.no_grad():
+                target_class = model(img_tensor).argmax(1).item()
+            heatmap = generate_heatmap(model, img_tensor, method, arch_key, target_class)
+            gt_mask = (np.array(Image.open(row["mask_path"]).convert("L")) > 127).astype(np.float32)
 
             for t in sweep_thresholds:
-                plaus = compute_plausibility(heatmap, gt_mask, [t])
+                plaus = compute_plausibility(heatmap, gt_mask, [round(t, 1)])
                 sweep_results.append({
                     "arch": arch_key, "method": method,
                     "threshold": round(t, 1),
@@ -1614,7 +1665,7 @@ for arch_key in ARCHITECTURES:
 
 sweep_df = pd.DataFrame(sweep_results)
 # Plot: IoU vs threshold for each method, faceted by architecture
-# (code omitted for brevity — use seaborn FacetGrid with hue=method)
+# (seaborn FacetGrid with hue=method)
 ```
 
 ---
@@ -1880,7 +1931,7 @@ Quick-reference table connecting every actionable EDA finding to its implementat
 | EDA Finding | Severity | Plan Location | What Changed |
 |-------------|----------|---------------|--------------|
 | 58.3× class imbalance (DF vs NV) | **High** | Step B.2 | `CrossEntropyLoss` replaced with `FocalLoss(gamma=2)` |
-| 19.1% of masked images have lesion area < 5% | **High** | Steps A.4, E.1, G.2 | `lesion_area_frac` + `lesion_size_group` columns added; plausibility reported separately for small/standard lesions |
+| 19.1% of masked images have lesion area < 5% | **High** | Steps A.4, E.1, G.2 | `lesion_area_frac` + `lesion_size_group` columns added to `plaus_df`; Phase E stratifies plausibility by size group |
 | 46.7% of training labels are non-histopathology | Medium | Steps A.3, H.3 | `diagnosis_confirm_type` retained in all DataFrames; Step H.3 added for sensitivity analysis |
 | Patient-level leakage (~26% multi-image lesions) | Medium | Step A.3, thesis §5.1 | `lesion_id` attached to `train_df`; documented as known limitation — no re-split |
 | Test set is sharper than train (Cohen's d = 0.21) | Low | Phase E validation note | Caveat added: heatmaps on test may appear sharper, inflating plausibility scores marginally |

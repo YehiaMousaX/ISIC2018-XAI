@@ -1,5 +1,5 @@
 {
-  "id": "yehiasamir/isic2018-xai-evaluation",
+  "id": "yehiasamir/isic2018-xai-evaluation-pipeline",
   "title": "ISIC2018 XAI Evaluation Pipeline",
   "code_file": "../../XAI_Evaluation_Pipeline_Kaggle.ipynb",
   "language": "python",
@@ -9,9 +9,7 @@
   "enable_tpu": false,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": [
-    "yehiasamir/isic2018-dataset"
-  ],
+  "dataset_sources": ["yehiasamir/isic2018-dataset", "yehiasamir/hf-credentials"],
   "competition_sources": [],
   "kernel_sources": []
 }

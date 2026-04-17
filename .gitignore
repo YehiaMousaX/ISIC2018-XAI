@@ -6,6 +6,7 @@ dataset_preparation.txt
 # ── Generated outputs (reproducible from the notebook) ───────────────────────
 outputs/
 prepared/
+errors/
 __pycache__/
 *.pyc
 
@@ -20,3 +21,4 @@ scripts/pipeline.env
 Thumbs.db
 *.swp
 .vscode/
+

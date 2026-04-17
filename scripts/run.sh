@@ -35,6 +35,19 @@ OUT_DIR="outputs/${TIMESTAMP}"
 POLL_INTERVAL="${POLL_INTERVAL:-60}"
 MAX_WAIT="${MAX_WAIT:-36000}"
 
+PY_SOURCE="${NOTEBOOK%.ipynb}.py"
+
+# ── 0. Sync .py → .ipynb ─────────────────────────────────────
+echo ""
+echo "━━━ [0/4] Syncing .py → .ipynb ━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [[ -f "$PY_SOURCE" ]]; then
+  jupytext --to notebook --set-kernel python3 \
+           --output "$NOTEBOOK" "$PY_SOURCE"
+  echo "✓ ${NOTEBOOK} updated from ${PY_SOURCE}"
+else
+  echo "No .py source found (${PY_SOURCE}) — using existing notebook."
+fi
+
 if [[ ! -f "$NOTEBOOK" ]]; then
   echo "Notebook not found: $NOTEBOOK" >&2
   echo "Set NOTEBOOK in scripts/pipeline.env or create the file first." >&2
@@ -108,7 +121,17 @@ done
 echo ""
 echo "━━━ [4/4] Pulling results ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 mkdir -p "$OUT_DIR"
-kaggle kernels output "$KERNEL_ID" -p "$OUT_DIR" --quiet
+MAX_PULL_ATTEMPTS=5
+pull_attempt=0
+until kaggle kernels output "$KERNEL_ID" -p "$OUT_DIR" --quiet; do
+  pull_attempt=$((pull_attempt + 1))
+  if [[ $pull_attempt -ge $MAX_PULL_ATTEMPTS ]]; then
+    echo "✗ Pull failed after ${MAX_PULL_ATTEMPTS} attempts." >&2
+    exit 1
+  fi
+  echo "  Pull attempt ${pull_attempt} failed (IncompleteRead?), retrying in 15s..."
+  sleep 15
+done
 echo "✓ Results saved to ${OUT_DIR}/"
 
 echo ""
