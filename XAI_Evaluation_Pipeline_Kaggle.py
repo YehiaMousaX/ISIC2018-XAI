@@ -119,8 +119,8 @@ ATTR_DIR  = os.path.join(DATA_ROOT, "plausibility", "attributes")
 # ── Model / training ───────────────────────────────────────────────────────────────
 IMG_SIZE     = 224
 BATCH_SIZE   = 32
-MAX_EPOCHS   = 50  if not DEBUG else 3
-PATIENCE     = 7   if not DEBUG else 2
+MAX_EPOCHS   = 300  if not DEBUG else 3
+PATIENCE     = 30   if not DEBUG else 2
 LR           = 1e-4
 WEIGHT_DECAY = 1e-4
 NUM_CLASSES  = 7
@@ -137,7 +137,7 @@ AOPC_STEPS          = 9
 
 # ── Architectures ────────────────────────────────────────────────────────────────────
 ARCHITECTURES = {
-    "efficientnet_b0": {"family": "cnn", "timm_name": "efficientnet_b0"},
+    "efficientnet_b2": {"family": "cnn", "timm_name": "efficientnet_b2"},
     "densenet121":     {"family": "cnn", "timm_name": "densenet121"},
     "vit_base_16":     {"family": "vit", "timm_name": "vit_base_patch16_224"},
     "swin_tiny":       {"family": "vit", "timm_name": "swin_tiny_patch4_window7_224"},
@@ -518,12 +518,12 @@ test_ds  = ISICSkinDataset(test_df,  TEST_IMG,  eval_transform, load_masks=True)
 
 with open(os.path.join(PREP_ROOT, "class_weights.json")) as f:
     cw = json.load(f)
-sample_weights = [cw[str(int(l))] for l in train_df["label_idx"]]
-sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
-
 _persist = NUM_WORKERS > 0   # keep workers alive across epochs — eliminates
                              # "can only test a child process" GC noise
-train_loader = DataLoader(train_ds, BATCH_SIZE, sampler=sampler,
+# WeightedRandomSampler removed — class-weighted CE already corrects for imbalance.
+# Using both together over-corrects: minority classes dominate batches AND receive
+# elevated loss weight, causing precision collapse on MEL/NV.
+train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
                           num_workers=NUM_WORKERS, pin_memory=True,
                           persistent_workers=_persist)
 val_loader   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False,
@@ -631,7 +631,7 @@ import timm
 
 # Grad-CAM target layers (last feature-producing conv layer per CNN arch)
 GRADCAM_LAYERS = {
-    "efficientnet_b0": "conv_head",
+    "efficientnet_b2": "conv_head",
     "densenet121":     "features.denseblock4.denselayer16.conv2",
     "vit_base_16":     None,   # uses Attention Rollout in Phase C
     "swin_tiny":       None,   # uses Attention Rollout in Phase C
@@ -670,11 +670,42 @@ torch.cuda.empty_cache()
 
 # %%
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from sklearn.metrics import balanced_accuracy_score
 from tqdm.auto import tqdm
 import copy
+
+
+class ClassBalancedFocalLoss(nn.Module):
+    """Focal Loss modulated by inverse-frequency class weights.
+
+    Combines Paper 2's finding (Focal Loss → lower variance, more stable minority
+    recall) with class weighting (the primary imbalance fix). gamma=2 is standard.
+    """
+    def __init__(self, weights: torch.Tensor, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("weights", weights)
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, targets, weight=self.weights, reduction="none")
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+
+# Minority class indices (CLASS_NAMES = ["MEL","NV","BCC","AKIEC","BKL","DF","VASC"])
+# AKIEC=3, DF=5, VASC=6 — fewest samples; BCC=2 also scarce (514 imgs)
+MINORITY_CLASS_INDICES = frozenset([2, 3, 5, 6])
+
+
+def mixup_batch(
+    x: torch.Tensor, y: torch.Tensor, alpha: float = 0.2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[idx], y, y[idx], lam
 
 
 def train_one_model(arch_key, train_loader, val_loader):
@@ -686,16 +717,21 @@ def train_one_model(arch_key, train_loader, val_loader):
         cw = json.load(f)
     weights   = torch.tensor([cw[str(i)] for i in range(NUM_CLASSES)],
                              dtype=torch.float32).to(DEVICE)
-    # Class-weighted CrossEntropy: the single technique that delivered ≥10% MCA
-    # improvement for the ISIC 2018 competition winners (focal loss was second).
-    criterion = nn.CrossEntropyLoss(weight=weights)
+    # Class-Balanced Focal Loss: combines inverse-frequency class weights (≥10% MCA
+    # gain per Paper 2) with focal modulation (γ=2) for lower variance on minority
+    # classes. Paper 2 found Focal Loss more stable than plain weighted CE across folds.
+    criterion = ClassBalancedFocalLoss(weights=weights, gamma=2.0)
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+    # T_max set to PATIENCE*3 so the cosine decay completes within the window
+    # where training is still active. T_max=MAX_EPOCHS caused the scheduler to
+    # barely move before early stopping fired (LR dropped <9% before stopping).
+    scheduler = CosineAnnealingLR(optimizer, T_max=PATIENCE * 3, eta_min=1e-6)
 
     best_val_loss    = float("inf")
     best_state       = None
     patience_counter = 0
+    patience_window  = []   # smoothed val_loss over last 3 epochs
     history          = {"train_loss": [], "val_loss": [], "val_bacc": []}
 
     epoch_bar = tqdm(range(MAX_EPOCHS), desc=arch_key, unit="epoch")
@@ -708,7 +744,14 @@ def train_one_model(arch_key, train_loader, val_loader):
         for imgs, labels, _, _ in batch_bar:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            loss = criterion(model(imgs), labels)
+            # Mixup only when the batch contains minority-class samples (AKIEC/DF/VASC/BCC).
+            # Creates synthetic signal without naive oversampling.
+            if MINORITY_CLASS_INDICES.intersection(labels.cpu().tolist()):
+                mixed, ya, yb, lam = mixup_batch(imgs, labels)
+                logits_mix = model(mixed)
+                loss = lam * criterion(logits_mix, ya) + (1 - lam) * criterion(logits_mix, yb)
+            else:
+                loss = criterion(model(imgs), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * imgs.size(0)
@@ -745,8 +788,15 @@ def train_one_model(arch_key, train_loader, val_loader):
             flush=True
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss    = val_loss
+        # Smooth over last 3 epochs before comparing — val set is only 193 images
+        # and val_loss fluctuates enough to misfire early stopping on noise.
+        patience_window.append(val_loss)
+        if len(patience_window) > 3:
+            patience_window.pop(0)
+        smoothed_val_loss = sum(patience_window) / len(patience_window)
+
+        if smoothed_val_loss < best_val_loss:
+            best_val_loss    = smoothed_val_loss
             best_state       = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
@@ -822,7 +872,11 @@ plt.show()
 # ## B.4 — Test-Set Classification Performance
 # Per-model classification report and confusion matrix. This is **not** the XAI
 # evaluation — it establishes baseline performance to contextualise XAI results.
-# 
+#
+# TTA (Test Time Augmentation): 5 forward passes per image (original + H-flip +
+# V-flip + 90° rot + 180° rot), softmax averaged. Expected +3–6% bAcc at zero
+# retraining cost. Especially beneficial for minority classes with few test samples.
+#
 # > **Target:** ≥80% balanced accuracy on ≥2 models. Models below ~60% bAcc produce
 # > unreliable explanations and should be flagged.
 
@@ -830,6 +884,25 @@ plt.show()
 from sklearn.metrics import classification_report, confusion_matrix, balanced_accuracy_score
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+
+def tta_predict(model: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    """5-view TTA: original + H-flip + V-flip + 90° rot + 180° rot.
+
+    Returns averaged softmax probabilities of shape (N, NUM_CLASSES).
+    """
+    views = [
+        imgs,
+        imgs.flip(-1),                        # horizontal flip
+        imgs.flip(-2),                        # vertical flip
+        torch.rot90(imgs, 1, [-2, -1]),       # 90°
+        torch.rot90(imgs, 2, [-2, -1]),       # 180°
+    ]
+    probs = torch.stack(
+        [torch.softmax(model(v), dim=1) for v in views]
+    )  # (5, N, C)
+    return probs.mean(0)                      # (N, C)
+
 
 test_results = {}   # arch_key → {preds, labels, probs, report}
 
@@ -840,10 +913,10 @@ for arch_key, model in trained_models.items():
     with torch.no_grad():
         for imgs, labels, _, _ in test_loader:
             imgs   = imgs.to(DEVICE)
-            logits = model(imgs)
-            all_preds.extend(logits.argmax(1).cpu().numpy())
+            probs  = tta_predict(model, imgs)
+            all_preds.extend(probs.argmax(1).cpu().numpy())
             all_labels.extend(labels.numpy())
-            all_probs.extend(torch.softmax(logits, 1).cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
     report = classification_report(
         all_labels, all_preds, target_names=CLASS_NAMES, output_dict=True, zero_division=0
@@ -945,18 +1018,21 @@ print("\neval_subsets ready — all XAI phases operate on these.")
 # %% [markdown]
 # ## B.6 — Weighted Ensemble Evaluation
 # Weighted average of softmax probability vectors across all 4 models.
-# Weights are set equal by default; tune manually on the validation set
-# following the ISIC 2018 winners' approach (∑wᵢ = 1).
+# Weights are derived from each model's best validation balanced accuracy —
+# better val performance → higher weight. Follows the ISIC 2018 winners'
+# approach of tuning weights on the validation set (∑wᵢ = 1).
 #
 # FinalScore = Σ wᵢ · sᵢ   where sᵢ is the 7-dim softmax vector for model i.
 
 # %%
-ENSEMBLE_WEIGHTS = {
-    "efficientnet_b0": 0.25,
-    "densenet121":     0.25,
-    "vit_base_16":     0.25,
-    "swin_tiny":       0.25,
-}
+# Derive ensemble weights from peak val bAcc recorded during training.
+# Normalise so weights sum to 1 — models that validated better get more say.
+_val_baccs = {k: max(train_histories[k]["val_bacc"]) for k in ARCHITECTURES}
+_total     = sum(_val_baccs.values())
+ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_baccs.items()}
+print("Val-tuned ensemble weights:")
+for k, w in ENSEMBLE_WEIGHTS.items():
+    print(f"  {k:20s}  val_bAcc={_val_baccs[k]:.4f}  weight={w:.4f}")
 assert abs(sum(ENSEMBLE_WEIGHTS.values()) - 1.0) < 1e-6, "Ensemble weights must sum to 1"
 
 # Stack per-model probability arrays (N_test × NUM_CLASSES) weighted sum
@@ -965,7 +1041,7 @@ ensemble_probs = sum(
     for k in ARCHITECTURES
 )
 ensemble_preds  = ensemble_probs.argmax(axis=1)
-ensemble_labels = test_results["efficientnet_b0"]["labels"]   # same for all models
+ensemble_labels = test_results[next(iter(ARCHITECTURES))]["labels"]   # same for all models
 
 from sklearn.metrics import classification_report, balanced_accuracy_score
 ensemble_bacc = balanced_accuracy_score(ensemble_labels, ensemble_preds)

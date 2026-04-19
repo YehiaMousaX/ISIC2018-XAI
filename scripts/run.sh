@@ -57,14 +57,16 @@ fi
 # ── 1. Commit & push to GitHub ────────────────────────────────
 echo ""
 echo "━━━ [1/4] Saving to GitHub ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-git add "$NOTEBOOK" SETUP.md scripts/SETUP.md scripts/pipeline.env 2>/dev/null || true
+git add "$NOTEBOOK" "$PY_SOURCE" mds/ scripts/ SETUP.md 2>/dev/null || true
 
-if git diff --cached --quiet; then
+MSG="experiment: ${TIMESTAMP}"
+[[ -n "$NOTE" ]] && MSG="${MSG} — ${NOTE}"
+
+if git diff --cached --quiet && git diff --quiet HEAD; then
   echo "No changes to commit — pushing as-is."
 else
-  MSG="experiment: ${TIMESTAMP}"
-  [[ -n "$NOTE" ]] && MSG="${MSG} — ${NOTE}"
-  git commit -m "$MSG"
+  git add -A
+  git commit -m "$MSG" || echo "Nothing new to commit."
 fi
 
 git push
@@ -138,11 +140,15 @@ echo ""
 find "$OUT_DIR" -maxdepth 2 | sort | sed "s|$OUT_DIR/||" | head -40
 
 # Print the evaluation report if it exists
-REPORT=$(find "$OUT_DIR" -name "evaluation_report_*.txt" | head -1)
+REPORT=$(find "$OUT_DIR" -name "evaluation_report*.txt" | head -1)
 if [[ -n "$REPORT" ]]; then
   echo ""
-  echo "━━━ RESULTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  cat "$REPORT"
+  echo "=== RESULTS ==="
+  PYTHONIOENCODING=utf-8 python3 -c "
+import sys
+with open(sys.argv[1], encoding='utf-8', errors='replace') as f:
+    print(f.read())
+" "$REPORT" 2>/dev/null || cat "$REPORT" || true
 fi
 
 # Save a note alongside the results
@@ -153,15 +159,7 @@ fi
 # ── Snapshot: notebook + git info ─────────────────────────────
 cp "$NOTEBOOK" "$OUT_DIR/notebook.ipynb"
 git log -1 --format="commit %H%nauthor %an%ndate   %ai%nsubject %s" > "$OUT_DIR/git_commit.txt"
-git diff HEAD~1 HEAD -- "$NOTEBOOK" \
-  | python -c "
-import sys, json, re
-patch = sys.stdin.read()
-# Extract only +/- lines from cells (skip JSON boilerplate)
-lines = [l for l in patch.splitlines()
-         if re.match(r'^[+-]', l) and not re.match(r'^(---|\+\+\+|--- a|\\+\\+\\+ b)', l)]
-print('\n'.join(lines))
-" > "$OUT_DIR/notebook_diff.txt" 2>/dev/null || true
+git show HEAD > "$OUT_DIR/run_diff.patch" 2>/dev/null || git diff HEAD~1 HEAD > "$OUT_DIR/run_diff.patch" 2>/dev/null || true
 
 echo ""
 echo "━━━ Done ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

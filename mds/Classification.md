@@ -251,3 +251,87 @@ Avoid:
 | Weighted ensemble | ✅ B.6 | Equal weights by default; tune on val set |
 | SENet-154 / PNASNet-5-Large | ❌ | Kept EfficientNet/DenseNet/ViT/Swin for XAI comparability |
 | 5-fold cross-validation | ❌ | Pre-split dataset used; single fixed train/val/test |
+| Class-Balanced Focal Loss (γ=2) | ✅ B.2 | Replaces plain CE; lower variance per Paper 2 analysis |
+| Test Time Augmentation (5×) | ✅ B.4 | H-flip, V-flip, 90°, 180° rotations averaged at inference |
+| Val-tuned ensemble weights | ✅ B.6 | Weights ∝ each model's best val bAcc (not equal 0.25) |
+| EfficientNet-B0 → B2 | ✅ B.1 | Stronger backbone (+9.1M params); same conv_head GradCAM |
+| Mixup for minority classes | ✅ B.2 | Applied when batch contains AKIEC/DF/VASC samples |
+
+---
+
+## Comparative Analysis: Two ISIC 2018 Approaches
+
+### Paper 1: Li & Li — Segmentation-Crop Strategy
+
+**Core Philosophy:** Leverage Task 1 (Segmentation) to boost Task 3 (Classification) via lesion cropping.
+
+**Cross-Task Transfer Learning Chain:**
+1. Train ResNet50 on Task 3 (Classification) → skin-lesion-aware weights
+2. Use those weights to initialize Mask R-CNN for Task 1 (Segmentation) → Jaccard improved 0.783 → **0.818**
+3. Use improved Mask R-CNN to **crop backgrounds** from all Task 3 images
+4. Re-train Classifier on cropped images only
+
+**Result:** +2% improvement in normalized multi-class accuracy
+
+**Key Risk:** Performance *"highly depends on the performance of the lesion boundary segmentation model."* If segmentation fails, classifier sees a cut-off lesion.
+
+**Models Used:** ResNet50 (segmentation init), ResNet152, DenseNet201, Inception_V4
+**Loss:** Class-Weighted CrossEntropy
+**Ensemble:** None — compared single models via confusion matrix
+**Best Reported:** **81.5%** Balanced Multi-Class Accuracy
+
+---
+
+### Detailed Comparison: Paper 1 (Li & Li) vs Paper 2 (Zhuang et al.)
+
+#### Handling Data Imbalance
+
+| Technique | Paper 1 (Li & Li) | Paper 2 (Zhuang et al.) |
+|:---|:---|:---|
+| **Class Weighting** | Yes. Explicitly uses class weights to balance dataset. | Yes (Extensive Analysis). Compared Class-Weighted CE vs Focal Loss. Class-Weighted gave higher absolute MCA; Focal Loss gave lower variance. |
+| **Resampling** | Not mentioned. | Tried and Rejected. Neither undersampling nor oversampling brought obvious improvement — sometimes worse. |
+| **Feature Space Manipulation** | Not used. | Experimental Only. Tried Triplet Loss and Contrastive Loss (Siamese). Failed — difficulty mining hard pairs in this domain (unlike faces). |
+
+#### Model Architecture & Ensemble
+
+| Aspect | Paper 1 (Li & Li) | Paper 2 (Zhuang et al.) |
+|:---|:---|:---|
+| **Base Models** | ResNet50, ResNet152, DenseNet201, Inception_V4 | **SENet-154** and **PNASNet-5-Large** |
+| **Ensemble Logic** | No Ensemble. Individual models compared separately. | **Weighted Average Ensemble.** Formula: Σ wᵢsᵢ. Slightly better than direct average or hard voting. |
+| **Why Specific Models?** | Common ImageNet backbones for reproducibility. | SENet/PNASNet chosen because they *"exhibit powerful abilities in learning features in the case of insufficient training data."* |
+
+#### Segmentation-First vs End-to-End
+
+| Criteria | Paper 1 (Crop Strategy) | Paper 2 (Ensemble Strategy) |
+|:---|:---|:---|
+| **Inference stages** | Two-stage (Seg → Class) | Single-stage forward pass |
+| **Error propagation** | High — seg failure → class failure | Low |
+| **Computational cost** | High prep (train 2 models); low inference | High inference (2 giant models per image) |
+| **Modern relevance** | Low-Medium (Mask R-CNN + ResNet152 = 2018 standard) | Medium-High (SENet attention ≈ modern ViT logic) |
+| **Performance ceiling** | ~80–85% range | **93.1%** (Winner-tier 2018) |
+
+---
+
+## Hybrid Plan: Targeting 80–85% Balanced Accuracy
+
+**Philosophy:** Borrow Paper 2's single-stage principle (no separate segmentation model) but apply Paper 1's insight that background noise matters — using **Random Resized Crop** as a stochastic, cheap approximation of explicit lesion cropping.
+
+### Component Decisions
+
+| Component | Choice | Rationale |
+|:---|:---|:---|
+| **Backbones** | EfficientNet-B2, DenseNet121, ViT-Base, Swin-Tiny | Swin/ViT attention suppresses background (Paper 2 logic) without separate segmentation |
+| **Loss** | Class-Balanced Focal Loss (γ=2) | Paper 2: lower variance across folds → more stable minority-class recall |
+| **Augmentation** | Random Resized Crop + Mixup (minority only) | Cheap stochastic approximation of Paper 1's "crop the lesion" + synthetic signal for DF/VASC/AKIEC |
+| **Ensemble** | 4-model weighted average, weights ∝ val bAcc | Middle ground: Paper 1's "no ensemble" is wasteful; Paper 2's manual tuning is replaced by automatic val-set derivation |
+| **TTA** | 5× (H-flip, V-flip, 90°, 180° rotations) | +3–6% bAcc with zero retraining cost |
+
+### Expected Gains by Component
+
+| Priority | Change | Requires Retraining | Expected bAcc Gain |
+|:---|:---|:---|:---|
+| 1 | TTA (5× flips/rots) | No | +3–6% |
+| 2 | Val-tuned ensemble weights | No | +1–3% |
+| 3 | Class-Balanced Focal Loss (γ=2) | Yes | +1–4% |
+| 4 | EfficientNet-B0 → B2 | Yes | +1–3% |
+| 5 | Mixup for minority classes | Yes | +1–2% |
