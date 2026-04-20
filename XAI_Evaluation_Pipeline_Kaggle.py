@@ -83,7 +83,7 @@ from tqdm.auto import tqdm
 
 
 # ── Execution mode ──────────────────────────────────────────────────────────────────
-DEBUG  = False   # True → small subset, 3 epochs; False → full Kaggle run
+DEBUG  = True   # True → small subset, 3 epochs; False → full Kaggle run
 KAGGLE = "KAGGLE_URL_BASE" in os.environ
 SEED   = 42
 
@@ -117,13 +117,19 @@ MASK_DIR  = os.path.join(DATA_ROOT, "plausibility", "masks")
 ATTR_DIR  = os.path.join(DATA_ROOT, "plausibility", "attributes")
 
 # ── Model / training ───────────────────────────────────────────────────────────────
-IMG_SIZE     = 224
+IMG_SIZE     = 256
 BATCH_SIZE   = 32
 MAX_EPOCHS   = 300  if not DEBUG else 3
 PATIENCE     = 30   if not DEBUG else 2
 LR           = 1e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 5e-4
 NUM_CLASSES  = 7
+
+# Regularisation / ensemble knobs
+LABEL_SMOOTHING = 0.05
+MIXUP_ALPHA     = 0.2     # 0 disables
+MIXUP_PROB      = 0.5     # apply mixup to 50% of batches
+EARLY_STOP_MIN_DELTA = 0.002   # on macro-F1
 _under_papermill = "PAPERMILL_OUTPUT_PATH" in os.environ or "PM_IN_EXECUTION" in os.environ
 NUM_WORKERS  = 4 if KAGGLE else 0
 
@@ -681,7 +687,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score, recall_score
+from sklearn.metrics import (balanced_accuracy_score, roc_auc_score,
+                             recall_score, f1_score, precision_score)
 from tqdm.auto import tqdm
 import copy
 
@@ -716,26 +723,44 @@ def mixup_batch(
     return lam * x + (1 - lam) * x[idx], y, y[idx], lam
 
 
+def _collect_val_outputs(model, val_loader, criterion):
+    """Run one val pass, return (loss, preds, labels, probs, logits)."""
+    model.eval()
+    loss_sum = 0.0
+    all_preds, all_labels, all_probs, all_logits = [], [], [], []
+    with torch.no_grad():
+        for imgs, labels, _, _ in val_loader:
+            imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
+            logits        = model(imgs)
+            loss_sum     += criterion(logits, labels).item() * imgs.size(0)
+            probs         = torch.softmax(logits, dim=1).cpu().numpy()
+            all_preds.extend(logits.argmax(1).cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs)
+            all_logits.extend(logits.cpu().numpy())
+    return (loss_sum / len(val_loader.dataset),
+            np.array(all_preds), np.array(all_labels),
+            np.array(all_probs), np.array(all_logits))
+
+
 def train_one_model(arch_key, train_loader, val_loader):
     print(f"\n{chr(61)*60}\n  Training: {arch_key}\n{chr(61)*60}", flush=True)
 
     model, _, _ = create_model(arch_key)
 
-    # Combo A: plain CrossEntropyLoss — imbalance handled by WeightedRandomSampler
-    # in the DataLoader; no additional loss weighting to avoid over-correction.
-    criterion = nn.CrossEntropyLoss()
+    # Label-smoothed CrossEntropy: softer targets reduce overconfidence and
+    # curb the train-loss→0 / val-loss-flat overfitting seen in prior runs.
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    # T_max set to PATIENCE*3 so the cosine decay completes within the window
-    # where training is still active. T_max=MAX_EPOCHS caused the scheduler to
-    # barely move before early stopping fired (LR dropped <9% before stopping).
     scheduler = CosineAnnealingLR(optimizer, T_max=PATIENCE * 3, eta_min=1e-6)
 
-    best_val_auc     = -1.0
+    best_val_f1      = -1.0
     best_state       = None
     patience_counter = 0
     history          = {"train_loss": [], "val_loss": [], "val_bacc": [],
-                        "val_auc": [], "val_per_class_recall": []}
+                        "val_auc": [], "val_f1_macro": [],
+                        "val_per_class_recall": []}
 
     epoch_bar = tqdm(range(MAX_EPOCHS), desc=arch_key, unit="epoch")
     for epoch in epoch_bar:
@@ -747,8 +772,13 @@ def train_one_model(arch_key, train_loader, val_loader):
         for imgs, labels, _, _ in batch_bar:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            # Combo A: no Mixup — imbalance corrected via sampler, not augmentation.
-            loss = criterion(model(imgs), labels)
+            # Mixup on a fraction of batches. Regulariser on top of the sampler.
+            if MIXUP_ALPHA > 0 and np.random.rand() < MIXUP_PROB:
+                mixed_x, y_a, y_b, lam = mixup_batch(imgs, labels, alpha=MIXUP_ALPHA)
+                logits = model(mixed_x)
+                loss   = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
+            else:
+                loss = criterion(model(imgs), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * imgs.size(0)
@@ -756,24 +786,15 @@ def train_one_model(arch_key, train_loader, val_loader):
         train_loss = running_loss / len(train_loader.dataset)
 
         # ─ Validate ─
-        model.eval()
-        val_loss_sum                    = 0.0
-        all_preds, all_labels, all_probs = [], [], []
-        with torch.no_grad():
-            for imgs, labels, _, _ in tqdm(val_loader, desc="  val",
-                                           leave=False, unit="batch"):
-                imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
-                logits        = model(imgs)
-                val_loss_sum += criterion(logits, labels).item() * imgs.size(0)
-                probs         = torch.softmax(logits, dim=1).cpu().numpy()
-                all_preds.extend(logits.argmax(1).cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-                all_probs.extend(probs)
-        val_loss        = val_loss_sum / len(val_loader.dataset)
-        val_bacc        = balanced_accuracy_score(all_labels, all_preds)
-        val_auc         = roc_auc_score(all_labels, all_probs,
-                                        multi_class="ovr", average="macro")
-        per_class_recall = recall_score(all_labels, all_preds,
+        val_loss, val_preds, val_labels, val_probs, _ = _collect_val_outputs(
+            model, val_loader, criterion
+        )
+        val_bacc         = balanced_accuracy_score(val_labels, val_preds)
+        val_auc          = roc_auc_score(val_labels, val_probs,
+                                         multi_class="ovr", average="macro")
+        val_f1_macro     = f1_score(val_labels, val_preds,
+                                    average="macro", zero_division=0)
+        per_class_recall = recall_score(val_labels, val_preds,
                                         average=None, zero_division=0).tolist()
         scheduler.step()
 
@@ -781,6 +802,7 @@ def train_one_model(arch_key, train_loader, val_loader):
         history["val_loss"].append(val_loss)
         history["val_bacc"].append(val_bacc)
         history["val_auc"].append(val_auc)
+        history["val_f1_macro"].append(val_f1_macro)
         history["val_per_class_recall"].append(per_class_recall)
 
         recall_str = "  ".join(
@@ -790,21 +812,22 @@ def train_one_model(arch_key, train_loader, val_loader):
             tr_loss=f"{train_loss:.4f}",
             val_loss=f"{val_loss:.4f}",
             bAcc=f"{val_bacc:.4f}",
-            AUC=f"{val_auc:.4f}",
+            F1=f"{val_f1_macro:.4f}",
         )
         print(
             f"  [{arch_key}] Ep {epoch+1:02d}/{MAX_EPOCHS}"
             f" | train={train_loss:.4f} | val={val_loss:.4f}"
-            f" | bAcc={val_bacc:.4f} | AUC={val_auc:.4f}",
+            f" | bAcc={val_bacc:.4f} | AUC={val_auc:.4f}"
+            f" | F1={val_f1_macro:.4f}",
             flush=True,
         )
         print(f"    per-class recall: {recall_str}", flush=True)
 
-        # Early-stop on macro AUC-ROC (higher = better).
-        # AUC uses ranking scores, not hard predictions, so one flipped DF sample
-        # does not move it by 5% as it does with bAcc on n≈20 val samples.
-        if val_auc > best_val_auc:
-            best_val_auc     = val_auc
+        # Early-stop on macro-F1 with a min-delta: AUC was too flat to trigger
+        # early stopping (0.95→0.975 over 40 epochs). F1 moves with the actual
+        # decisions the classifier makes, so the patience counter has signal.
+        if val_f1_macro > best_val_f1 + EARLY_STOP_MIN_DELTA:
+            best_val_f1      = val_f1_macro
             best_state       = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
@@ -814,7 +837,18 @@ def train_one_model(arch_key, train_loader, val_loader):
                 break
 
     model.load_state_dict(best_state)
-    return model, history
+    # One clean val pass on the best checkpoint — used for temperature scaling
+    # and per-class threshold tuning in the ensemble step.
+    _, _, best_val_labels, best_val_probs, best_val_logits = _collect_val_outputs(
+        model, val_loader, criterion
+    )
+    val_snapshot = {
+        "labels": best_val_labels,
+        "probs":  best_val_probs,
+        "logits": best_val_logits,
+        "best_f1": best_val_f1,
+    }
+    return model, history, val_snapshot
 
 # %% [markdown]
 # ## B.3 — Train All 4 Models
@@ -823,10 +857,12 @@ def train_one_model(arch_key, train_loader, val_loader):
 
 # %%
 trained_models  = {}   # arch_key → model (on CPU)
-train_histories = {}   # arch_key → {train_loss, val_loss, val_bacc}
+train_histories = {}   # arch_key → history dict
+val_snapshots   = {}   # arch_key → {labels, probs, logits, best_f1}
 
 for arch_key in ARCHITECTURES:
-    model, history = train_one_model(arch_key, train_loader, val_loader)
+    model, history, val_snapshot = train_one_model(arch_key, train_loader, val_loader)
+    val_snapshots[arch_key] = val_snapshot
 
     ckpt_path = os.path.join(OUT_ROOT, f"{arch_key}_best.pt")
     torch.save(model.state_dict(), ckpt_path)
@@ -847,7 +883,8 @@ print("\n✓ All 4 models trained and saved.")
 import matplotlib.pyplot as plt
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-colors = {"train_loss": "#e05c5c", "val_loss": "#5c9be0", "val_auc": "#5cbf7a"}
+colors = {"train_loss": "#e05c5c", "val_loss": "#5c9be0",
+          "val_f1":     "#5cbf7a", "val_auc": "#b57edc"}
 
 for ax, (arch_key, hist) in zip(axes.flat, train_histories.items()):
     epochs = range(1, len(hist["train_loss"]) + 1)
@@ -857,13 +894,15 @@ for ax, (arch_key, hist) in zip(axes.flat, train_histories.items()):
             lw=1.8, label="Train loss")
     ax.plot(epochs, hist["val_loss"],   color=colors["val_loss"],
             lw=1.8, linestyle="--", label="Val loss")
-    ax2.plot(epochs, hist["val_auc"],   color=colors["val_auc"],
-             lw=1.5, linestyle=":", label="Val AUC (macro)")
+    ax2.plot(epochs, hist["val_f1_macro"], color=colors["val_f1"],
+             lw=1.5, linestyle=":", label="Val F1 (macro)")
+    ax2.plot(epochs, hist["val_auc"],      color=colors["val_auc"],
+             lw=1.2, linestyle=":", alpha=0.7, label="Val AUC (macro)")
 
     ax.set_title(arch_key, fontsize=11, fontweight="bold")
     ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
-    ax2.set_ylabel("Macro AUC-ROC", color=colors["val_auc"])
-    ax2.tick_params(axis="y", labelcolor=colors["val_auc"])
+    ax2.set_ylabel("Macro F1 / AUC", color=colors["val_f1"])
+    ax2.tick_params(axis="y", labelcolor=colors["val_f1"])
     ax2.set_ylim(0, 1)
 
     lines1, labs1 = ax.get_legend_handles_labels()
@@ -978,22 +1017,113 @@ for arch_key, res in test_results.items():
     flag = "LOW" if bacc < 0.60 else "OK"
     summary_lines.append(f"{arch_key:20s} bAcc={bacc:.4f}  [{flag}]")
 
-# Plain-text summary report
+# Plain-text summary report (detailed)
 import datetime
+from sklearn.metrics import (top_k_accuracy_score, matthews_corrcoef,
+                              cohen_kappa_score)
+
+def _fmt_cm(cm: np.ndarray, names: list[str]) -> str:
+    width = max(6, max(len(n) for n in names) + 1)
+    header = " " * width + "".join(f"{n:>{width}}" for n in names) + "   (row=true)"
+    lines  = [header]
+    for i, n in enumerate(names):
+        row = f"{n:<{width}}" + "".join(f"{cm[i, j]:>{width}d}" for j in range(len(names)))
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def _per_model_section(arch_key: str, labels: np.ndarray, preds: np.ndarray,
+                       probs: np.ndarray) -> str:
+    report = classification_report(labels, preds, target_names=CLASS_NAMES,
+                                   zero_division=0, digits=4)
+    bacc   = balanced_accuracy_score(labels, preds)
+    f1m    = f1_score(labels, preds, average="macro", zero_division=0)
+    f1w    = f1_score(labels, preds, average="weighted", zero_division=0)
+    try:
+        auc = roc_auc_score(labels, probs, multi_class="ovr", average="macro")
+    except ValueError:
+        auc = float("nan")
+    top3   = top_k_accuracy_score(labels, probs, k=3, labels=list(range(NUM_CLASSES)))
+    mcc    = matthews_corrcoef(labels, preds)
+    kappa  = cohen_kappa_score(labels, preds)
+    cm     = confusion_matrix(labels, preds, labels=list(range(NUM_CLASSES)))
+
+    out = []
+    out.append("=" * 72)
+    out.append(f"MODEL: {arch_key}")
+    out.append("=" * 72)
+    out.append(f"Balanced accuracy : {bacc:.4f}")
+    out.append(f"Accuracy (top-1)  : {(preds == labels).mean():.4f}")
+    out.append(f"Accuracy (top-3)  : {top3:.4f}")
+    out.append(f"Macro F1          : {f1m:.4f}")
+    out.append(f"Weighted F1       : {f1w:.4f}")
+    out.append(f"Macro AUC-ROC     : {auc:.4f}")
+    out.append(f"MCC               : {mcc:.4f}")
+    out.append(f"Cohen kappa       : {kappa:.4f}")
+    out.append("")
+    out.append("Per-class report:")
+    out.append(report)
+    out.append("Confusion matrix (counts):")
+    out.append(_fmt_cm(cm, CLASS_NAMES))
+    out.append("")
+    return "\n".join(out)
+
+
 report_path = os.path.join(OUT_ROOT, "evaluation_report.txt")
-with open(report_path, "w") as _f:
-    _f.write("ISIC2018 XAI Evaluation Report")
-    _f.write(f"Generated : {datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}")
-    _f.write(f"DEBUG      : {DEBUG}")
-    _f.write("=" * 60 + "")
+with open(report_path, "w", encoding="utf-8") as _f:
+    _f.write("ISIC2018 XAI — Evaluation Report\n")
+    _f.write(f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    _f.write(f"DEBUG     : {DEBUG}\n")
+    _f.write(f"IMG_SIZE  : {IMG_SIZE}   BATCH_SIZE: {BATCH_SIZE}\n")
+    _f.write(f"LR        : {LR}   WEIGHT_DECAY: {WEIGHT_DECAY}\n")
+    _f.write(f"Label smoothing: {LABEL_SMOOTHING}   Mixup α={MIXUP_ALPHA} p={MIXUP_PROB}\n")
+    _f.write("=" * 72 + "\n")
+
+    _f.write("\nSUMMARY\n")
+    _f.write("-" * 72 + "\n")
     for line in summary_lines:
-        _f.write(line + "")
-    _f.write("" + "=" * 60 + "")
+        _f.write(line + "\n")
+    _f.write("\n")
+
+    # Training summary per model
+    _f.write("TRAINING SUMMARY\n")
+    _f.write("-" * 72 + "\n")
+    for arch_key in ARCHITECTURES:
+        h = train_histories[arch_key]
+        epochs_run = len(h["train_loss"])
+        _f.write(
+            f"{arch_key:20s}  epochs={epochs_run:3d}  "
+            f"best_val_F1={max(h['val_f1_macro']):.4f}  "
+            f"best_val_bAcc={max(h['val_bacc']):.4f}  "
+            f"best_val_AUC={max(h['val_auc']):.4f}  "
+            f"final_train_loss={h['train_loss'][-1]:.4f}  "
+            f"final_val_loss={h['val_loss'][-1]:.4f}\n"
+        )
+    _f.write("\n")
+
+    # Per-model detailed sections
     for arch_key, res in test_results.items():
-        _f.write(f"{arch_key}")
-        _f.write(classification_report(res["labels"], res["preds"],
-                                       target_names=CLASS_NAMES, zero_division=0))
-print("" + "=" * 60)
+        _f.write(_per_model_section(arch_key, res["labels"], res["preds"], res["probs"]))
+
+    # Ensemble section
+    _f.write("=" * 72 + "\n")
+    _f.write("ENSEMBLE (temperature-scaled, per-class threshold-tuned)\n")
+    _f.write("=" * 72 + "\n")
+    _f.write("Model temperatures:\n")
+    for k, T in model_temperatures.items():
+        _f.write(f"  {k:20s}  T={T:.3f}\n")
+    _f.write("Weights (by val macro-F1):\n")
+    for k, w in ENSEMBLE_WEIGHTS.items():
+        _f.write(f"  {k:20s}  w={w:.4f}\n")
+    _f.write("Per-class prior scales α (tuned on val for macro-F1):\n")
+    for c, s in zip(CLASS_NAMES, class_scales):
+        _f.write(f"  {c:8s}  α={s:.3f}\n")
+    _f.write("\n")
+    # For AUC/top-k we pass the calibrated (un-scaled) probs, which are proper
+    # probabilities. The tuned preds still reflect the α-scaled argmax decision.
+    _f.write(_per_model_section("ensemble", ensemble_labels, ensemble_preds, ensemble_probs))
+
+print("\n" + "=" * 60)
 print("Summary:")
 for line in summary_lines:
     print(" ", line)
@@ -1033,23 +1163,96 @@ print("\neval_subsets ready — all XAI phases operate on these.")
 # FinalScore = Σ wᵢ · sᵢ   where sᵢ is the 7-dim softmax vector for model i.
 
 # %%
-# Derive ensemble weights from peak val macro AUC-ROC recorded during training.
-# AUC is more stable than bAcc on the tiny minority val splits (DF n≈20).
-_val_aucs = {k: max(train_histories[k]["val_auc"]) for k in ARCHITECTURES}
-_total    = sum(_val_aucs.values())
-ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_aucs.items()}
-print("Val-tuned ensemble weights (by macro AUC-ROC):")
+# ── Temperature scaling (per model) ──────────────────────────────────────────
+# Fit a single scalar T per model by minimising NLL on the val snapshot.
+# Better-calibrated probabilities → better weighted averaging in the ensemble.
+def fit_temperature(val_logits: np.ndarray, val_labels: np.ndarray) -> float:
+    logits_t = torch.tensor(val_logits, dtype=torch.float32)
+    labels_t = torch.tensor(val_labels, dtype=torch.long)
+    log_T    = torch.zeros(1, requires_grad=True)   # parameterise log T for stability
+    opt      = torch.optim.LBFGS([log_T], lr=0.1, max_iter=50)
+    nll      = nn.CrossEntropyLoss()
+    def _closure():
+        opt.zero_grad()
+        loss = nll(logits_t / log_T.exp(), labels_t)
+        loss.backward()
+        return loss
+    opt.step(_closure)
+    return float(log_T.exp().item())
+
+
+def apply_temperature(probs_or_logits: np.ndarray, T: float, from_logits: bool) -> np.ndarray:
+    if from_logits:
+        x = probs_or_logits / T
+    else:
+        # convert probs → logits via log, then rescale
+        x = np.log(np.clip(probs_or_logits, 1e-12, 1.0)) / T
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=1, keepdims=True)
+
+
+model_temperatures = {}
+for k in ARCHITECTURES:
+    snap = val_snapshots[k]
+    T = fit_temperature(snap["logits"], snap["labels"])
+    model_temperatures[k] = T
+    print(f"  {k:20s}  temperature T={T:.3f}")
+
+# Weight each model by its val macro-F1 (what we optimised) rather than AUC.
+_val_f1s = {k: val_snapshots[k]["best_f1"] for k in ARCHITECTURES}
+_total   = sum(_val_f1s.values())
+ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_f1s.items()}
+print("Val-tuned ensemble weights (by macro-F1):")
 for k, w in ENSEMBLE_WEIGHTS.items():
-    print(f"  {k:20s}  val_AUC={_val_aucs[k]:.4f}  weight={w:.4f}")
+    print(f"  {k:20s}  val_F1={_val_f1s[k]:.4f}  T={model_temperatures[k]:.3f}  weight={w:.4f}")
 assert abs(sum(ENSEMBLE_WEIGHTS.values()) - 1.0) < 1e-6, "Ensemble weights must sum to 1"
 
-# Stack per-model probability arrays (N_test × NUM_CLASSES) weighted sum
-ensemble_probs = sum(
-    ENSEMBLE_WEIGHTS[k] * test_results[k]["probs"]
+# Temperature-scale each model's *test* probs before weighted averaging.
+# We only have post-TTA probs in test_results[k]["probs"] (not logits), so we
+# apply T in log-prob space — equivalent for calibration purposes.
+test_probs_cal = {
+    k: apply_temperature(test_results[k]["probs"], model_temperatures[k], from_logits=False)
     for k in ARCHITECTURES
-)
-ensemble_preds  = ensemble_probs.argmax(axis=1)
-ensemble_labels = test_results[next(iter(ARCHITECTURES))]["labels"]   # same for all models
+}
+ensemble_probs = sum(ENSEMBLE_WEIGHTS[k] * test_probs_cal[k] for k in ARCHITECTURES)
+
+# ── Per-class threshold tuning on val ────────────────────────────────────────
+# Default argmax often over-predicts the majority class (NV). For each class we
+# scale its column by a factor α_c chosen on val to maximise macro-F1. This is
+# equivalent to applying a per-class bias on log-probs before argmax.
+val_probs_cal = {
+    k: apply_temperature(val_snapshots[k]["probs"], model_temperatures[k], from_logits=False)
+    for k in ARCHITECTURES
+}
+val_ensemble_probs  = sum(ENSEMBLE_WEIGHTS[k] * val_probs_cal[k] for k in ARCHITECTURES)
+val_ensemble_labels = val_snapshots[next(iter(ARCHITECTURES))]["labels"]
+
+def tune_class_scales(probs: np.ndarray, labels: np.ndarray,
+                      grid=np.linspace(0.6, 1.6, 21)) -> np.ndarray:
+    """Coordinate search on α ∈ R^C (per-class multiplicative prior)."""
+    C      = probs.shape[1]
+    alpha  = np.ones(C)
+    for _ in range(3):                                 # 3 sweeps is plenty
+        for c in range(C):
+            best_f1, best_a = -1.0, alpha[c]
+            for a in grid:
+                alpha[c] = a
+                preds    = (probs * alpha).argmax(axis=1)
+                f1       = f1_score(labels, preds, average="macro", zero_division=0)
+                if f1 > best_f1:
+                    best_f1, best_a = f1, a
+            alpha[c] = best_a
+    return alpha
+
+class_scales = tune_class_scales(val_ensemble_probs, val_ensemble_labels)
+print("Per-class scales tuned on val (macro-F1):")
+for c, s in zip(CLASS_NAMES, class_scales):
+    print(f"  {c:8s}  α={s:.3f}")
+
+ensemble_probs_tuned = ensemble_probs * class_scales
+ensemble_preds       = ensemble_probs_tuned.argmax(axis=1)
+ensemble_labels      = test_results[next(iter(ARCHITECTURES))]["labels"]
 
 from sklearn.metrics import classification_report, balanced_accuracy_score
 ensemble_bacc = balanced_accuracy_score(ensemble_labels, ensemble_preds)
@@ -1078,8 +1281,12 @@ plt.show()
 # Save ensemble metrics
 with open(os.path.join(OUT_ROOT, "metrics_ensemble.json"), "w") as _f:
     json.dump({
-        "weights": ENSEMBLE_WEIGHTS,
+        "weights":       ENSEMBLE_WEIGHTS,
+        "temperatures":  model_temperatures,
+        "class_scales":  {c: float(s) for c, s in zip(CLASS_NAMES, class_scales)},
         "balanced_accuracy": round(float(ensemble_bacc), 4),
+        "macro_f1":      round(float(f1_score(ensemble_labels, ensemble_preds,
+                                              average="macro", zero_division=0)), 4),
         "classification_report": classification_report(
             ensemble_labels, ensemble_preds,
             target_names=CLASS_NAMES, zero_division=0, output_dict=True
