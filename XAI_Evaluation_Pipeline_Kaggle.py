@@ -1069,65 +1069,6 @@ def _per_model_section(arch_key: str, labels: np.ndarray, preds: np.ndarray,
     return "\n".join(out)
 
 
-report_path = os.path.join(OUT_ROOT, "evaluation_report.txt")
-with open(report_path, "w", encoding="utf-8") as _f:
-    _f.write("ISIC2018 XAI — Evaluation Report\n")
-    _f.write(f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-    _f.write(f"DEBUG     : {DEBUG}\n")
-    _f.write(f"IMG_SIZE  : {IMG_SIZE}   BATCH_SIZE: {BATCH_SIZE}\n")
-    _f.write(f"LR        : {LR}   WEIGHT_DECAY: {WEIGHT_DECAY}\n")
-    _f.write(f"Label smoothing: {LABEL_SMOOTHING}   Mixup α={MIXUP_ALPHA} p={MIXUP_PROB}\n")
-    _f.write("=" * 72 + "\n")
-
-    _f.write("\nSUMMARY\n")
-    _f.write("-" * 72 + "\n")
-    for line in summary_lines:
-        _f.write(line + "\n")
-    _f.write("\n")
-
-    # Training summary per model
-    _f.write("TRAINING SUMMARY\n")
-    _f.write("-" * 72 + "\n")
-    for arch_key in ARCHITECTURES:
-        h = train_histories[arch_key]
-        epochs_run = len(h["train_loss"])
-        _f.write(
-            f"{arch_key:20s}  epochs={epochs_run:3d}  "
-            f"best_val_F1={max(h['val_f1_macro']):.4f}  "
-            f"best_val_bAcc={max(h['val_bacc']):.4f}  "
-            f"best_val_AUC={max(h['val_auc']):.4f}  "
-            f"final_train_loss={h['train_loss'][-1]:.4f}  "
-            f"final_val_loss={h['val_loss'][-1]:.4f}\n"
-        )
-    _f.write("\n")
-
-    # Per-model detailed sections
-    for arch_key, res in test_results.items():
-        _f.write(_per_model_section(arch_key, res["labels"], res["preds"], res["probs"]))
-
-    # Ensemble section
-    _f.write("=" * 72 + "\n")
-    _f.write("ENSEMBLE (temperature-scaled, per-class threshold-tuned)\n")
-    _f.write("=" * 72 + "\n")
-    _f.write("Model temperatures:\n")
-    for k, T in model_temperatures.items():
-        _f.write(f"  {k:20s}  T={T:.3f}\n")
-    _f.write("Weights (by val macro-F1):\n")
-    for k, w in ENSEMBLE_WEIGHTS.items():
-        _f.write(f"  {k:20s}  w={w:.4f}\n")
-    _f.write("Per-class prior scales α (tuned on val for macro-F1):\n")
-    for c, s in zip(CLASS_NAMES, class_scales):
-        _f.write(f"  {c:8s}  α={s:.3f}\n")
-    _f.write("\n")
-    # For AUC/top-k we pass the calibrated (un-scaled) probs, which are proper
-    # probabilities. The tuned preds still reflect the α-scaled argmax decision.
-    _f.write(_per_model_section("ensemble", ensemble_labels, ensemble_preds, ensemble_probs))
-
-print("\n" + "=" * 60)
-print("Summary:")
-for line in summary_lines:
-    print(" ", line)
-print(f"Report saved to {report_path}")
 
 # %% [markdown]
 # ## B.5 — Correct-Only Evaluation Subset
@@ -1300,3 +1241,62 @@ ensemble_results = {
     "labels": ensemble_labels,
     "probs":  ensemble_probs,
 }
+
+# Detailed evaluation report (written after all ensemble variables are available)
+report_path = os.path.join(OUT_ROOT, "evaluation_report.txt")
+with open(report_path, "w", encoding="utf-8") as _f:
+    _f.write("ISIC2018 XAI — Evaluation Report\n")
+    _f.write(f"Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    _f.write(f"DEBUG     : {DEBUG}\n")
+    _f.write(f"IMG_SIZE  : {IMG_SIZE}   BATCH_SIZE: {BATCH_SIZE}\n")
+    _f.write(f"LR        : {LR}   WEIGHT_DECAY: {WEIGHT_DECAY}\n")
+    _f.write(f"Label smoothing: {LABEL_SMOOTHING}   Mixup α={MIXUP_ALPHA} p={MIXUP_PROB}\n")
+    _f.write("=" * 72 + "\n")
+
+    _f.write("\nSUMMARY\n")
+    _f.write("-" * 72 + "\n")
+    for line in summary_lines:
+        _f.write(line + "\n")
+    _f.write("\n")
+
+    # Training summary per model
+    _f.write("TRAINING SUMMARY\n")
+    _f.write("-" * 72 + "\n")
+    for arch_key in ARCHITECTURES:
+        h = train_histories[arch_key]
+        epochs_run = len(h["train_loss"])
+        _f.write(
+            f"{arch_key:20s}  epochs={epochs_run:3d}  "
+            f"best_val_F1={max(h['val_f1_macro']):.4f}  "
+            f"best_val_bAcc={max(h['val_bacc']):.4f}  "
+            f"best_val_AUC={max(h['val_auc']):.4f}  "
+            f"final_train_loss={h['train_loss'][-1]:.4f}  "
+            f"final_val_loss={h['val_loss'][-1]:.4f}\n"
+        )
+    _f.write("\n")
+
+    # Per-model detailed sections
+    for arch_key, res in test_results.items():
+        _f.write(_per_model_section(arch_key, res["labels"], res["preds"], res["probs"]))
+
+    # Ensemble section
+    _f.write("=" * 72 + "\n")
+    _f.write("ENSEMBLE (temperature-scaled, per-class threshold-tuned)\n")
+    _f.write("=" * 72 + "\n")
+    _f.write("Model temperatures:\n")
+    for k, T in model_temperatures.items():
+        _f.write(f"  {k:20s}  T={T:.3f}\n")
+    _f.write("Weights (by val macro-F1):\n")
+    for k, w in ENSEMBLE_WEIGHTS.items():
+        _f.write(f"  {k:20s}  w={w:.4f}\n")
+    _f.write("Per-class prior scales α (tuned on val for macro-F1):\n")
+    for c, s in zip(CLASS_NAMES, class_scales):
+        _f.write(f"  {c:8s}  α={s:.3f}\n")
+    _f.write("\n")
+    _f.write(_per_model_section("ensemble", ensemble_labels, ensemble_preds, ensemble_probs))
+
+print("\n" + "=" * 60)
+print("Summary:")
+for line in summary_lines:
+    print(" ", line)
+print(f"Report saved to {report_path}")
