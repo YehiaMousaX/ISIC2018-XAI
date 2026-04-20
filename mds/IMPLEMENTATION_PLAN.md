@@ -515,61 +515,56 @@ torch.cuda.empty_cache()
 
 #### Step B.2 — Training Loop (Single Architecture)
 
-**Goal:** A reusable `train_one_model(arch_key)` function with: **Focal Loss** (replaces weighted CE — see EDA §B/§J), AdamW + cosine annealing, early stopping on val loss, checkpoint saving. Returns the trained model + training history.
+**Goal:** A reusable `train_one_model(arch_key)` function with: **WeightedRandomSampler + plain CrossEntropyLoss** (Combo A), AdamW + cosine annealing, **early stopping on macro AUC-ROC** (not val loss), per-class recall logged every epoch, checkpoint saving. Returns the trained model + training history.
 
-> **EDA rationale:** The 58.3× class imbalance (DF vs NV) makes plain weighted CrossEntropyLoss insufficient — it still allows easy NV predictions to dominate the gradient. Focal Loss adds a `(1 − p)^γ` modulating factor that down-weights high-confidence majority predictions, focusing capacity on DF (115 images) and VASC (142 images). This is critical for producing meaningful XAI explanations on minority classes.
+> **Why macro AUC-ROC for early stopping (not val loss or bAcc):**
+> The val set has only ~20 DF samples and ~25 VASC samples. One flipped prediction shifts
+> `balanced_accuracy_score` by 5%, making it an unreliable stopping signal — the model
+> appears to jump between 0.59 and 0.84 bAcc across adjacent epochs purely from noise.
+> `roc_auc_score(..., multi_class='ovr', average='macro')` uses *ranking scores* (soft
+> probabilities), not hard predictions, so a single minority sample flipping does not
+> move it by 5%. Macro averaging gives each of the 7 classes equal weight regardless of
+> support, which is exactly right for a thesis focused on minority-class XAI quality.
+>
+> **Why per-class recall logged every epoch:**
+> Aggregate bAcc hides *which* class is unstable. Printing per-class recall each epoch
+> lets you see "DF recall=0.45→0.60→0.45" and diagnose the source of noise, rather than
+> treating the whole model as oscillating.
+>
+> **Why not switch to weighted F1 or macro-F1:**
+> Weighted F1 weights by support, which means NV (6,705 samples) dominates — opposite
+> of what is needed for minority-class fairness. Macro-F1 is threshold-based, so a
+> single DF flip still moves it; AUC strictly dominates it at the same compute cost.
 
 ```python
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score, recall_score
 import copy
-
-FOCAL_GAMMA = 2.0  # standard starting value; sweep [1, 2, 3] in ablations if needed
-
-class FocalLoss(nn.Module):
-    """Multiclass Focal Loss with per-class weights.
-    gamma=0 reduces to weighted CrossEntropyLoss.
-    """
-    def __init__(self, weight=None, gamma=FOCAL_GAMMA, reduction="mean"):
-        super().__init__()
-        self.weight    = weight   # class-frequency weights (tensor on DEVICE)
-        self.gamma     = gamma
-        self.reduction = reduction
-
-    def forward(self, logits, targets):
-        # Standard CE (with class weights)
-        ce = nn.functional.cross_entropy(logits, targets,
-                                         weight=self.weight,
-                                         reduction="none")
-        # Probability of the true class
-        pt = torch.exp(-ce)
-        focal = (1 - pt) ** self.gamma * ce
-        return focal.mean() if self.reduction == "mean" else focal
 
 
 def train_one_model(arch_key, train_loader, val_loader):
     print(f"\n{'='*60}\n  Training: {arch_key}\n{'='*60}")
 
-    model, _, family = create_model(arch_key)
+    model, _, _ = create_model(arch_key)
 
-    # ── Focal Loss with class weights ──
-    with open(os.path.join(PREP_ROOT, "class_weights.json")) as f:
-        cw = json.load(f)
-    weights = torch.tensor([cw[str(i)] for i in range(NUM_CLASSES)],
-                           dtype=torch.float32).to(DEVICE)
-    criterion = FocalLoss(weight=weights, gamma=FOCAL_GAMMA)
+    # Combo A: plain CE — imbalance corrected via WeightedRandomSampler in the loader.
+    # Using both sampler and weighted CE over-corrects and collapses MEL/NV precision.
+    criterion = nn.CrossEntropyLoss()
 
-    # ── Optimizer & scheduler ──
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS)
+    # T_max = PATIENCE*3 so cosine decay completes within the active training window.
+    scheduler = CosineAnnealingLR(optimizer, T_max=PATIENCE * 3, eta_min=1e-6)
 
-    # ── Training loop ──
-    best_val_loss = float("inf")
+    best_val_auc     = -1.0
     best_model_state = None
     patience_counter = 0
-    history = {"train_loss": [], "val_loss": [], "val_bacc": []}
+    history = {
+        "train_loss": [], "val_loss": [], "val_bacc": [],
+        "val_auc": [],             # macro AUC-ROC — primary early-stop criterion
+        "val_per_class_recall": [] # per-epoch list of 7 recall values
+    }
 
     for epoch in range(MAX_EPOCHS):
         # — Train —
@@ -578,8 +573,7 @@ def train_one_model(arch_key, train_loader, val_loader):
         for imgs, labels, _, _ in train_loader:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            logits = model(imgs)
-            loss = criterion(logits, labels)
+            loss = criterion(model(imgs), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * imgs.size(0)
@@ -588,30 +582,41 @@ def train_one_model(arch_key, train_loader, val_loader):
         # — Validate —
         model.eval()
         val_loss_sum = 0.0
-        all_preds, all_labels = [], []
+        all_preds, all_labels, all_probs = [], [], []
         with torch.no_grad():
             for imgs, labels, _, _ in val_loader:
                 imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
                 logits = model(imgs)
                 val_loss_sum += criterion(logits, labels).item() * imgs.size(0)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
                 all_preds.extend(logits.argmax(1).cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-        val_loss = val_loss_sum / len(val_loader.dataset)
-        val_bacc = balanced_accuracy_score(all_labels, all_preds)
+                all_probs.extend(probs)
 
+        val_loss        = val_loss_sum / len(val_loader.dataset)
+        val_bacc        = balanced_accuracy_score(all_labels, all_preds)
+        val_auc         = roc_auc_score(all_labels, all_probs,
+                                        multi_class="ovr", average="macro")
+        per_class_recall = recall_score(all_labels, all_preds,
+                                        average=None, zero_division=0).tolist()
         scheduler.step()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_bacc"].append(val_bacc)
+        history["val_auc"].append(val_auc)
+        history["val_per_class_recall"].append(per_class_recall)
 
+        recall_str = "  ".join(f"{n}={r:.2f}" for n, r in zip(CLASS_NAMES, per_class_recall))
         print(f"  Epoch {epoch+1:02d}/{MAX_EPOCHS} | "
-              f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-              f"val_bAcc={val_bacc:.4f}")
+              f"train={train_loss:.4f} | val={val_loss:.4f} | "
+              f"bAcc={val_bacc:.4f} | AUC={val_auc:.4f}")
+        print(f"    per-class recall: {recall_str}")
 
-        # — Early stopping on val loss —
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # — Early stop on macro AUC-ROC (higher = better) —
+        # AUC uses soft probabilities; one minority sample flipping does not move it 5%.
+        if val_auc > best_val_auc:
+            best_val_auc     = val_auc
             best_model_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
@@ -624,7 +629,7 @@ def train_one_model(arch_key, train_loader, val_loader):
     return model, history
 ```
 
-**Validation:** Run with `DEBUG=True` (3 epochs). Loss decreases. No NaN. No CUDA OOM.
+**Validation:** Run with `DEBUG=True` (3 epochs). `val_auc` is in [0.5, 1.0]. Per-class recall prints 7 values each epoch. No NaN. No CUDA OOM.
 
 ---
 

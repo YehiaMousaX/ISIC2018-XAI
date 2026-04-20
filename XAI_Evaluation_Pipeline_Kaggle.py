@@ -681,7 +681,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score, recall_score
 from tqdm.auto import tqdm
 import copy
 
@@ -731,11 +731,11 @@ def train_one_model(arch_key, train_loader, val_loader):
     # barely move before early stopping fired (LR dropped <9% before stopping).
     scheduler = CosineAnnealingLR(optimizer, T_max=PATIENCE * 3, eta_min=1e-6)
 
-    best_val_loss    = float("inf")
+    best_val_auc     = -1.0
     best_state       = None
     patience_counter = 0
-    patience_window  = []   # smoothed val_loss over last 3 epochs
-    history          = {"train_loss": [], "val_loss": [], "val_bacc": []}
+    history          = {"train_loss": [], "val_loss": [], "val_bacc": [],
+                        "val_auc": [], "val_per_class_recall": []}
 
     epoch_bar = tqdm(range(MAX_EPOCHS), desc=arch_key, unit="epoch")
     for epoch in epoch_bar:
@@ -757,43 +757,54 @@ def train_one_model(arch_key, train_loader, val_loader):
 
         # ─ Validate ─
         model.eval()
-        val_loss_sum          = 0.0
-        all_preds, all_labels = [], []
+        val_loss_sum                    = 0.0
+        all_preds, all_labels, all_probs = [], [], []
         with torch.no_grad():
             for imgs, labels, _, _ in tqdm(val_loader, desc="  val",
                                            leave=False, unit="batch"):
                 imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
                 logits        = model(imgs)
                 val_loss_sum += criterion(logits, labels).item() * imgs.size(0)
+                probs         = torch.softmax(logits, dim=1).cpu().numpy()
                 all_preds.extend(logits.argmax(1).cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
-        val_loss = val_loss_sum / len(val_loader.dataset)
-        val_bacc = balanced_accuracy_score(all_labels, all_preds)
+                all_probs.extend(probs)
+        val_loss        = val_loss_sum / len(val_loader.dataset)
+        val_bacc        = balanced_accuracy_score(all_labels, all_preds)
+        val_auc         = roc_auc_score(all_labels, all_probs,
+                                        multi_class="ovr", average="macro")
+        per_class_recall = recall_score(all_labels, all_preds,
+                                        average=None, zero_division=0).tolist()
         scheduler.step()
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_bacc"].append(val_bacc)
+        history["val_auc"].append(val_auc)
+        history["val_per_class_recall"].append(per_class_recall)
 
+        recall_str = "  ".join(
+            f"{n}={r:.2f}" for n, r in zip(CLASS_NAMES, per_class_recall)
+        )
         epoch_bar.set_postfix(
             tr_loss=f"{train_loss:.4f}",
             val_loss=f"{val_loss:.4f}",
-            bAcc=f"{val_bacc:.4f}"
+            bAcc=f"{val_bacc:.4f}",
+            AUC=f"{val_auc:.4f}",
         )
         print(
-            f"  [{arch_key}] Ep {epoch+1:02d}/{MAX_EPOCHS}" f" | train={train_loss:.4f}" f" | val={val_loss:.4f}" f" | bAcc={val_bacc:.4f}",
-            flush=True
+            f"  [{arch_key}] Ep {epoch+1:02d}/{MAX_EPOCHS}"
+            f" | train={train_loss:.4f} | val={val_loss:.4f}"
+            f" | bAcc={val_bacc:.4f} | AUC={val_auc:.4f}",
+            flush=True,
         )
+        print(f"    per-class recall: {recall_str}", flush=True)
 
-        # Smooth over last 3 epochs before comparing — val set is only 1,458 images
-        # and val_loss fluctuates enough to misfire early stopping on noise.
-        patience_window.append(val_loss)
-        if len(patience_window) > 3:
-            patience_window.pop(0)
-        smoothed_val_loss = sum(patience_window) / len(patience_window)
-
-        if smoothed_val_loss < best_val_loss:
-            best_val_loss    = smoothed_val_loss
+        # Early-stop on macro AUC-ROC (higher = better).
+        # AUC uses ranking scores, not hard predictions, so one flipped DF sample
+        # does not move it by 5% as it does with bAcc on n≈20 val samples.
+        if val_auc > best_val_auc:
+            best_val_auc     = val_auc
             best_state       = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
@@ -836,7 +847,7 @@ print("\n✓ All 4 models trained and saved.")
 import matplotlib.pyplot as plt
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-colors = {"train_loss": "#e05c5c", "val_loss": "#5c9be0", "val_bacc": "#5cbf7a"}
+colors = {"train_loss": "#e05c5c", "val_loss": "#5c9be0", "val_auc": "#5cbf7a"}
 
 for ax, (arch_key, hist) in zip(axes.flat, train_histories.items()):
     epochs = range(1, len(hist["train_loss"]) + 1)
@@ -846,13 +857,13 @@ for ax, (arch_key, hist) in zip(axes.flat, train_histories.items()):
             lw=1.8, label="Train loss")
     ax.plot(epochs, hist["val_loss"],   color=colors["val_loss"],
             lw=1.8, linestyle="--", label="Val loss")
-    ax2.plot(epochs, hist["val_bacc"],  color=colors["val_bacc"],
-             lw=1.5, linestyle=":", label="Val bAcc")
+    ax2.plot(epochs, hist["val_auc"],   color=colors["val_auc"],
+             lw=1.5, linestyle=":", label="Val AUC (macro)")
 
     ax.set_title(arch_key, fontsize=11, fontweight="bold")
     ax.set_xlabel("Epoch"); ax.set_ylabel("Loss")
-    ax2.set_ylabel("Balanced Accuracy", color=colors["val_bacc"])
-    ax2.tick_params(axis="y", labelcolor=colors["val_bacc"])
+    ax2.set_ylabel("Macro AUC-ROC", color=colors["val_auc"])
+    ax2.tick_params(axis="y", labelcolor=colors["val_auc"])
     ax2.set_ylim(0, 1)
 
     lines1, labs1 = ax.get_legend_handles_labels()
@@ -1022,14 +1033,14 @@ print("\neval_subsets ready — all XAI phases operate on these.")
 # FinalScore = Σ wᵢ · sᵢ   where sᵢ is the 7-dim softmax vector for model i.
 
 # %%
-# Derive ensemble weights from peak val bAcc recorded during training.
-# Normalise so weights sum to 1 — models that validated better get more say.
-_val_baccs = {k: max(train_histories[k]["val_bacc"]) for k in ARCHITECTURES}
-_total     = sum(_val_baccs.values())
-ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_baccs.items()}
-print("Val-tuned ensemble weights:")
+# Derive ensemble weights from peak val macro AUC-ROC recorded during training.
+# AUC is more stable than bAcc on the tiny minority val splits (DF n≈20).
+_val_aucs = {k: max(train_histories[k]["val_auc"]) for k in ARCHITECTURES}
+_total    = sum(_val_aucs.values())
+ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_aucs.items()}
+print("Val-tuned ensemble weights (by macro AUC-ROC):")
 for k, w in ENSEMBLE_WEIGHTS.items():
-    print(f"  {k:20s}  val_bAcc={_val_baccs[k]:.4f}  weight={w:.4f}")
+    print(f"  {k:20s}  val_AUC={_val_aucs[k]:.4f}  weight={w:.4f}")
 assert abs(sum(ENSEMBLE_WEIGHTS.values()) - 1.0) < 1e-6, "Ensemble weights must sum to 1"
 
 # Stack per-model probability arrays (N_test × NUM_CLASSES) weighted sum
