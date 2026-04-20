@@ -14,7 +14,7 @@ The ISIC 2018 challenge is divided into three tasks, each building on a shared i
 | Pool | Tasks | Images |
 |------|-------|--------|
 | Pool A | Task 1, Task 2 | 2,594 training + 100 val + 1,000 test |
-| Pool B | Task 3 | 10,015 training + 193 val + 1,512 test |
+| Pool B | Task 3 | 8,750 training + 1,458 val + 1,512 test |
 
 ---
 
@@ -23,8 +23,8 @@ The ISIC 2018 challenge is divided into three tasks, each building on a shared i
 ```
 Data/
 ├── images/
-│   ├── train/                               # 10,015 dermoscopy images (.jpg) — classification training
-│   ├── val/                                 # 193 images (.jpg)
+│   ├── train/                               # 8,750 dermoscopy images (.jpg) — classification training
+│   ├── val/                                 # 1,458 images (.jpg)
 │   └── test/                                # 1,512 images (.jpg)
 │
 ├── plausibility/
@@ -35,8 +35,8 @@ Data/
 │       # attributes: globules, milia_like_cyst, negative_network, pigment_network, streaks
 │
 └── csv/
-    ├── train.csv               # 10,015 rows — one-hot labels
-    ├── val.csv                 # 193 rows
+    ├── train.csv               # 8,750 rows — one-hot labels
+    ├── val.csv                 # 1,458 rows
     ├── test.csv                # 1,512 rows
     └── lesion_groupings.csv    # lesion_id ↔ image_id ↔ confirm type
 ```
@@ -83,14 +83,14 @@ This is the primary task for the XAI evaluation thesis.
 
 | Code | Full Name | Training Count | Training % |
 |------|-----------|---------------|-----------|
-| NV | Melanocytic Nevi | 6,705 | 66.95% |
-| MEL | Melanoma | 1,113 | 11.11% |
-| BKL | Benign Keratosis-like Lesions | 1,099 | 10.97% |
-| BCC | Basal Cell Carcinoma | 514 | 5.13% |
-| AKIEC | Actinic Keratoses & Intraepithelial Carcinoma | 327 | 3.27% |
-| VASC | Vascular Lesions | 142 | 1.42% |
-| DF | Dermatofibroma | 115 | 1.15% |
-| **Total** | | **10,015** | 100% |
+| NV | Melanocytic Nevi | 5,853 | 66.88% |
+| MEL | Melanoma | 972 | 11.11% |
+| BKL | Benign Keratosis-like Lesions | 961 | 10.98% |
+| BCC | Basal Cell Carcinoma | 454 | 5.19% |
+| AKIEC | Actinic Keratoses & Intraepithelial Carcinoma | 287 | 3.28% |
+| VASC | Vascular Lesions | 124 | 1.42% |
+| DF | Dermatofibroma | 99 | 1.13% |
+| **Total** | | **8,750** | 100% |
 
 **Class imbalance:** NV dominates at ~67%. The rarest class (DF) is 58× less frequent than NV. This severe imbalance requires weighted loss or oversampling strategies.
 
@@ -120,16 +120,16 @@ Each row has exactly one `1.0` — single-label classification (no multi-label c
 
 | Class | Training | Validation | Test |
 |-------|----------|-----------|------|
-| NV | 6,705 | 123 | 909 |
-| MEL | 1,113 | 21 | 171 |
-| BKL | 1,099 | 22 | 217 |
-| BCC | 514 | 15 | 93 |
-| AKIEC | 327 | 8 | 43 |
-| VASC | 142 | 3 | 35 |
-| DF | 115 | 1 | 44 |
-| **Total** | **10,015** | **193** | **1,512** |
+| NV | 5,853 | 975 | 909 |
+| MEL | 972 | 162 | 171 |
+| BKL | 961 | 160 | 217 |
+| BCC | 454 | 75 | 93 |
+| AKIEC | 287 | 48 | 43 |
+| VASC | 124 | 21 | 35 |
+| DF | 99 | 17 | 44 |
+| **Total** | **8,750** | **1,458** | **1,512** |
 
-**Note:** The validation set is very small (193 images) and the class proportions roughly mirror training. The test set (1,512 images) was the held-out challenge evaluation set — ground truth is now publicly available.
+**Note:** The validation set was enlarged from 193 to 1,458 by merging the original validation set into training and re-splitting stratified by class and lesion group. Class proportions are now balanced and validation signal is more stable. The test set (1,512 images) was the held-out challenge evaluation set — ground truth is now publicly available.
 
 ---
 
@@ -213,7 +213,7 @@ Task 3 image pool (10,015 images)
 
 Before training, the EDA notebook should verify:
 
-- [ ] Image count per split matches expected counts (10015 / 193 / 1512)
+- [ ] Image count per split matches expected counts (8750 / 1458 / 1512)
 - [ ] CSV row count matches image count (no orphaned labels)
 - [ ] One-hot sanity check: each row sums to exactly 1.0
 - [ ] Class distribution bar chart (highlight imbalance)

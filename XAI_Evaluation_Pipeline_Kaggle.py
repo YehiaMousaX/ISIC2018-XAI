@@ -42,14 +42,14 @@
 # ```
 # Data/
 # ├── csv/
-# │   ├── train.csv              # 10,015 rows | cols: image, MEL, NV, BCC, AKIEC, BKL, DF, VASC
-# │   ├── val.csv                #    193 rows
-# │   ├── test.csv               #  1,512 rows
+# │   ├── train.csv              # 8,750 rows | cols: image, MEL, NV, BCC, AKIEC, BKL, DF, VASC
+# │   ├── val.csv                # 1,458 rows
+# │   ├── test.csv               # 1,512 rows
 # │   └── lesion_groupings.csv   # image, lesion_id, diagnosis_confirm_type
 # ├── images/
-# │   ├── train/  (10,015 jpgs)
-# │   ├── val/    (   193 jpgs)
-# │   └── test/   ( 1,512 jpgs)
+# │   ├── train/  (8,750 jpgs)
+# │   ├── val/    (1,458 jpgs)
+# │   └── test/   (1,512 jpgs)
 # └── plausibility/
 #     ├── masks/       # 3,694 *_segmentation.png  ← binary lesion masks
 #     ├── images/      # corresponding RGB images
@@ -139,8 +139,8 @@ AOPC_STEPS          = 9
 ARCHITECTURES = {
     "efficientnet_b2": {"family": "cnn", "timm_name": "efficientnet_b2"},
     "densenet121":     {"family": "cnn", "timm_name": "densenet121"},
-    "vit_base_16":     {"family": "vit", "timm_name": "vit_base_patch16_224"},
-    "swin_tiny":       {"family": "vit", "timm_name": "swin_tiny_patch4_window7_224"},
+    # "vit_base_16":     {"family": "vit", "timm_name": "vit_base_patch16_224"},
+    # "swin_tiny":       {"family": "vit", "timm_name": "swin_tiny_patch4_window7_224"},
 }
 
 ATTR_TYPES = ["globules", "milia_like_cyst", "negative_network",
@@ -520,10 +520,18 @@ with open(os.path.join(PREP_ROOT, "class_weights.json")) as f:
     cw = json.load(f)
 _persist = NUM_WORKERS > 0   # keep workers alive across epochs — eliminates
                              # "can only test a child process" GC noise
-# WeightedRandomSampler removed — class-weighted CE already corrects for imbalance.
-# Using both together over-corrects: minority classes dominate batches AND receive
-# elevated loss weight, causing precision collapse on MEL/NV.
-train_loader = DataLoader(train_ds, BATCH_SIZE, shuffle=True,
+
+# ── Combo A: WeightedRandomSampler ──────────────────────────────────────────
+# Sample each image with probability proportional to its inverse class frequency.
+# Paired with plain CrossEntropyLoss (no class weights) — using both over-corrects
+# and collapses precision on MEL/NV.
+sample_weights = torch.tensor(
+    [cw[str(int(lbl))] for lbl in train_df["label_idx"].values],
+    dtype=torch.float32,
+)
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights),
+                                replacement=True)
+train_loader = DataLoader(train_ds, BATCH_SIZE, sampler=sampler,
                           num_workers=NUM_WORKERS, pin_memory=True,
                           persistent_workers=_persist)
 val_loader   = DataLoader(val_ds,   BATCH_SIZE, shuffle=False,
@@ -713,14 +721,9 @@ def train_one_model(arch_key, train_loader, val_loader):
 
     model, _, _ = create_model(arch_key)
 
-    with open(os.path.join(PREP_ROOT, "class_weights.json")) as f:
-        cw = json.load(f)
-    weights   = torch.tensor([cw[str(i)] for i in range(NUM_CLASSES)],
-                             dtype=torch.float32).to(DEVICE)
-    # Class-Balanced Focal Loss: combines inverse-frequency class weights (≥10% MCA
-    # gain per Paper 2) with focal modulation (γ=2) for lower variance on minority
-    # classes. Paper 2 found Focal Loss more stable than plain weighted CE across folds.
-    criterion = ClassBalancedFocalLoss(weights=weights, gamma=2.0)
+    # Combo A: plain CrossEntropyLoss — imbalance handled by WeightedRandomSampler
+    # in the DataLoader; no additional loss weighting to avoid over-correction.
+    criterion = nn.CrossEntropyLoss()
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     # T_max set to PATIENCE*3 so the cosine decay completes within the window
@@ -744,14 +747,8 @@ def train_one_model(arch_key, train_loader, val_loader):
         for imgs, labels, _, _ in batch_bar:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            # Mixup only when the batch contains minority-class samples (AKIEC/DF/VASC/BCC).
-            # Creates synthetic signal without naive oversampling.
-            if MINORITY_CLASS_INDICES.intersection(labels.cpu().tolist()):
-                mixed, ya, yb, lam = mixup_batch(imgs, labels)
-                logits_mix = model(mixed)
-                loss = lam * criterion(logits_mix, ya) + (1 - lam) * criterion(logits_mix, yb)
-            else:
-                loss = criterion(model(imgs), labels)
+            # Combo A: no Mixup — imbalance corrected via sampler, not augmentation.
+            loss = criterion(model(imgs), labels)
             loss.backward()
             optimizer.step()
             running_loss += loss.item() * imgs.size(0)
@@ -788,7 +785,7 @@ def train_one_model(arch_key, train_loader, val_loader):
             flush=True
         )
 
-        # Smooth over last 3 epochs before comparing — val set is only 193 images
+        # Smooth over last 3 epochs before comparing — val set is only 1,458 images
         # and val_loss fluctuates enough to misfire early stopping on noise.
         patience_window.append(val_loss)
         if len(patience_window) > 3:

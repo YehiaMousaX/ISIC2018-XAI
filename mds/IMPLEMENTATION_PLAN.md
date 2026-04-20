@@ -33,16 +33,16 @@ The dataset is pre-organised — splits, labels, and masks are already provided.
 ```
 Data/
 ├── csv/
-│   ├── train.csv              # 10,015 rows | cols: image, MEL, NV, BCC, AKIEC, BKL, DF, VASC (one-hot)
-│   ├── val.csv                #    193 rows | same cols (official validation set)
-│   ├── test.csv               #  1,512 rows | same cols (official test set)
+│   ├── train.csv              # 8,750 rows | cols: image, MEL, NV, BCC, AKIEC, BKL, DF, VASC (one-hot)
+│   ├── val.csv                # 1,458 rows | same cols (stratified validation set)
+│   ├── test.csv               # 1,512 rows | same cols (official test set)
 │   └── lesion_groupings.csv   # cols: image, lesion_id, diagnosis_confirm_type
 │                              # → lesion_id enables patient-level leakage analysis
 │
 ├── images/
-│   ├── train/                 # 10,015 ISIC_xxxxxxx.jpg
-│   ├── val/                   #    193 ISIC_xxxxxxx.jpg
-│   └── test/                  #  1,512 ISIC_xxxxxxx.jpg
+│   ├── train/                 # 8,750 ISIC_xxxxxxx.jpg
+│   ├── val/                   # 1,458 ISIC_xxxxxxx.jpg
+│   └── test/                  # 1,512 ISIC_xxxxxxx.jpg
 │
 └── plausibility/
     ├── masks/                 # 3,694 ISIC_xxxxxxx_segmentation.png  (binary lesion masks)
@@ -242,7 +242,7 @@ print(f"\nTrain label dist:\n{train_df['label_name'].value_counts()}")
 print(f"\nConfirmation type dist (train):\n{train_df['diagnosis_confirm_type'].value_counts()}")
 ```
 
-**Validation:** Train 10,015 / Val 193 / Test 1,512. 7 classes, NV dominates. `diagnosis_confirm_type` shows ~53% histopathology, ~37% serial imaging, ~9% consensus.
+**Validation:** Train 8,750 / Val 1,458 / Test 1,512. 7 classes, NV dominates. Stratified split with lesion grouping ensures no lesion leakage. `diagnosis_confirm_type` on training set shows ~53% histopathology, ~37% serial imaging, ~9% consensus.
 
 ---
 
