@@ -83,7 +83,7 @@ from tqdm.auto import tqdm
 
 
 # ── Execution mode ──────────────────────────────────────────────────────────────────
-DEBUG  = True   # True → small subset, 3 epochs; False → full Kaggle run
+DEBUG  = False   # True → small subset, 3 epochs; False → full Kaggle run
 KAGGLE = "KAGGLE_URL_BASE" in os.environ
 SEED   = 42
 

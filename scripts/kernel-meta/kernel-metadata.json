@@ -9,7 +9,7 @@
   "enable_tpu": false,
   "enable_internet": true,
   "machine_shape": "NvidiaTeslaT4",
-  "dataset_sources": ["yehiasamir/isic2018-dataset", "yehiasamir/hf-credentials"],
+  "dataset_sources": ["yehiasamir/isic2018-dataset", "yehiasamir/hf-credentials", "yehiasamir/new-train-val-csv"],
   "competition_sources": [],
   "kernel_sources": []
 }
