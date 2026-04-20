@@ -109,10 +109,35 @@ else:
     PREP_ROOT = "./prepared"
     OUT_ROOT  = "./outputs"
 
-CSV_DIR   = os.path.join(DATA_ROOT, "csv")
+# On Kaggle, use the separately uploaded re-split CSVs instead of the ones
+# bundled with the image dataset (which still reflect the old local split).
+CSV_DIR = (
+    "/kaggle/input/new-train-val-csv"
+    if KAGGLE else
+    os.path.join(DATA_ROOT, "csv")
+)
 TRAIN_IMG = os.path.join(DATA_ROOT, "images", "train")
 VAL_IMG   = os.path.join(DATA_ROOT, "images", "val")
 TEST_IMG  = os.path.join(DATA_ROOT, "images", "test")
+
+def find_image(img_id: str, primary_dir: str, ext: str = ".jpg") -> str:
+    """Return the path to an image.
+
+    On Kaggle the physical folder layout may not match the CSV split after a
+    local re-split, so we fall back to sibling train/ and val/ dirs.
+    Locally images are always in the correct folder, so no fallback is needed.
+    """
+    candidate = os.path.join(primary_dir, f"{img_id}{ext}")
+    if not KAGGLE:
+        return candidate
+    if os.path.exists(candidate):
+        return candidate
+    img_root = os.path.dirname(primary_dir)
+    for split in ("train", "val"):
+        p = os.path.join(img_root, split, f"{img_id}{ext}")
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Image not found for id={img_id}")
 MASK_DIR  = os.path.join(DATA_ROOT, "plausibility", "masks")
 ATTR_DIR  = os.path.join(DATA_ROOT, "plausibility", "attributes")
 
@@ -295,7 +320,7 @@ fig, axes = plt.subplots(1, NUM_CLASSES, figsize=(NUM_CLASSES * 2.5, 3))
 for ax, (i, cls_name) in zip(axes, enumerate(CLASS_NAMES)):
     row = train_df[train_df["label_name"] == cls_name].iloc[0]
     img = np.array(
-        Image.open(os.path.join(TRAIN_IMG, f"{row['image_id']}.jpg"))
+        Image.open(find_image(row['image_id'], TRAIN_IMG))
              .resize((160, 160))
     )
     ax.imshow(img)
@@ -426,7 +451,7 @@ pixel_sq_sum = np.zeros(3, dtype=np.float64)
 n_pixels     = 0
 
 for img_id in tqdm(sample_ids, desc="Computing stats"):
-    raw  = np.array(Image.open(os.path.join(TRAIN_IMG, f"{img_id}.jpg"))
+    raw  = np.array(Image.open(find_image(img_id, TRAIN_IMG))
                     .resize((IMG_SIZE, IMG_SIZE)))
     img  = apply_color_constancy(raw) / 255.0
     flat = img.reshape(-1, 3)
@@ -469,7 +494,7 @@ class ISICSkinDataset(Dataset):
         row  = self.df.iloc[idx]
         img  = apply_color_constancy(
                    np.array(Image.open(
-                       os.path.join(self.img_dir, f"{row['image_id']}.jpg")
+                       find_image(row['image_id'], self.img_dir)
                    ).convert("RGB"))
                )
 
