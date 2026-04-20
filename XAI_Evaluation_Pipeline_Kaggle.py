@@ -98,7 +98,7 @@ if KAGGLE:
     OUT_ROOT  = "/kaggle/working"
 
     from huggingface_hub import login
-    with open("/kaggle/input/hf-credentials/hf_token.txt") as f:
+    with open("/kaggle/input/datasets/yehiasamir/hf-credentials/hf_token.txt") as f:
         secret_value = f.read().strip()
     login(secret_value)
 
