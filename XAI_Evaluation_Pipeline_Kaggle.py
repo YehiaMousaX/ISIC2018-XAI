@@ -83,7 +83,7 @@ from tqdm.auto import tqdm
 
 
 # ── Execution mode ──────────────────────────────────────────────────────────────────
-DEBUG  = True   # True → small subset, 3 epochs; False → full Kaggle run
+DEBUG  = False   # True → small subset, 3 epochs; False → full Kaggle run
 KAGGLE = "KAGGLE_URL_BASE" in os.environ
 SEED   = 42
 
@@ -1119,7 +1119,8 @@ def fit_temperature(val_logits: np.ndarray, val_labels: np.ndarray) -> float:
         loss.backward()
         return loss
     opt.step(_closure)
-    return float(log_T.exp().item())
+    T = float(log_T.exp().item())
+    return float(np.clip(T, 0.1, 10.0))
 
 
 def apply_temperature(probs_or_logits: np.ndarray, T: float, from_logits: bool) -> np.ndarray:
