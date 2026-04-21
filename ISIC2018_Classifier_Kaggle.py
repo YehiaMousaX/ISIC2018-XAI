@@ -47,7 +47,7 @@ if KAGGLE:
     DATA_ROOT = "/kaggle/input/datasets/yehiasamir/isic2018-dataset/Data"
     PREP_ROOT = "/kaggle/working/prepared"
     OUT_ROOT  = "/kaggle/working"
-    CSV_DIR   = "/kaggle/input/new-train-val-csv"
+    CSV_DIR   = "/kaggle/input/datasets/yehiasamir/new-train-val-csv"
 
     from huggingface_hub import login
     with open("/kaggle/input/datasets/yehiasamir/hf-credentials/hf_token.txt") as f:
