@@ -145,7 +145,7 @@ ATTR_DIR  = os.path.join(DATA_ROOT, "plausibility", "attributes")
 IMG_SIZE     = 256
 BATCH_SIZE   = 32
 MAX_EPOCHS   = 300  if not DEBUG else 3
-PATIENCE     = 30   if not DEBUG else 2
+PATIENCE     = 10   if not DEBUG else 2
 LR           = 1e-4
 WEIGHT_DECAY = 5e-4
 NUM_CLASSES  = 7
@@ -154,6 +154,9 @@ NUM_CLASSES  = 7
 LABEL_SMOOTHING = 0.05
 MIXUP_ALPHA     = 0.2     # 0 disables
 MIXUP_PROB      = 0.5     # apply mixup to 50% of batches
+CUTMIX_ALPHA    = 1.0     # 0 disables; applied alongside mixup (random choice)
+CUTMIX_PROB     = 0.5     # conditional: when aug triggers, this fraction is CutMix
+USE_FOCAL_LOSS  = True    # ClassBalancedFocalLoss (γ=2, inv-freq) — minority boost
 EARLY_STOP_MIN_DELTA = 0.002   # on macro-F1
 _under_papermill = "PAPERMILL_OUTPUT_PATH" in os.environ or "PM_IN_EXECUTION" in os.environ
 NUM_WORKERS  = 4 if KAGGLE else 0
@@ -170,6 +173,7 @@ AOPC_STEPS          = 9
 ARCHITECTURES = {
     "efficientnet_b2": {"family": "cnn", "timm_name": "efficientnet_b2"},
     "densenet121":     {"family": "cnn", "timm_name": "densenet121"},
+    "convnext_tiny":   {"family": "cnn", "timm_name": "convnext_tiny"},
     # "vit_base_16":     {"family": "vit", "timm_name": "vit_base_patch16_224"},
     # "swin_tiny":       {"family": "vit", "timm_name": "swin_tiny_patch4_window7_224"},
 }
@@ -672,6 +676,7 @@ import timm
 GRADCAM_LAYERS = {
     "efficientnet_b2": "conv_head",
     "densenet121":     "features.denseblock4.denselayer16.conv2",
+    "convnext_tiny":   "stages.3.blocks.2.conv_dw",
     "vit_base_16":     None,   # uses Attention Rollout in Phase C
     "swin_tiny":       None,   # uses Attention Rollout in Phase C
 }
@@ -748,6 +753,42 @@ def mixup_batch(
     return lam * x + (1 - lam) * x[idx], y, y[idx], lam
 
 
+def cutmix_batch(
+    x: torch.Tensor, y: torch.Tensor, alpha: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """CutMix: paste a random patch from another image. lam = 1 - patch_area/img_area."""
+    lam = float(np.random.beta(alpha, alpha))
+    B, _, H, W = x.shape
+    idx = torch.randperm(B, device=x.device)
+    cut_rat = float(np.sqrt(1.0 - lam))
+    cw, ch  = int(W * cut_rat), int(H * cut_rat)
+    cx, cy  = np.random.randint(W), np.random.randint(H)
+    x1, x2  = max(0, cx - cw // 2), min(W, cx + cw // 2)
+    y1, y2  = max(0, cy - ch // 2), min(H, cy + ch // 2)
+    x_mix = x.clone()
+    x_mix[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
+    lam = 1.0 - ((x2 - x1) * (y2 - y1) / (W * H))
+    return x_mix, y, y[idx], lam
+
+
+def tta_predict(model: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
+    """5-view TTA: original + H-flip + V-flip + 90° rot + 180° rot.
+
+    Returns averaged softmax probabilities of shape (N, NUM_CLASSES).
+    Defined here (before training) so val-snapshot can reuse the same
+    inference path as test, keeping calibration/α-tuning aligned.
+    """
+    views = [
+        imgs,
+        imgs.flip(-1),
+        imgs.flip(-2),
+        torch.rot90(imgs, 1, [-2, -1]),
+        torch.rot90(imgs, 2, [-2, -1]),
+    ]
+    probs = torch.stack([torch.softmax(model(v), dim=1) for v in views])
+    return probs.mean(0)
+
+
 def _collect_val_outputs(model, val_loader, criterion):
     """Run one val pass, return (loss, preds, labels, probs, logits)."""
     model.eval()
@@ -773,9 +814,17 @@ def train_one_model(arch_key, train_loader, val_loader):
 
     model, _, _ = create_model(arch_key)
 
-    # Label-smoothed CrossEntropy: softer targets reduce overconfidence and
-    # curb the train-loss→0 / val-loss-flat overfitting seen in prior runs.
-    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    # Class-Balanced Focal Loss (γ=2) with inverse-frequency weights by default.
+    # Focal term focuses on hard/minority examples; weights further boost rare
+    # classes. Falls back to label-smoothed CE if USE_FOCAL_LOSS is False.
+    if USE_FOCAL_LOSS:
+        w_tensor = torch.tensor(
+            [class_weights[i] for i in range(NUM_CLASSES)],
+            dtype=torch.float32, device=DEVICE,
+        )
+        criterion = ClassBalancedFocalLoss(w_tensor, gamma=2.0)
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=PATIENCE * 3, eta_min=1e-6)
@@ -797,9 +846,13 @@ def train_one_model(arch_key, train_loader, val_loader):
         for imgs, labels, _, _ in batch_bar:
             imgs, labels = imgs.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad()
-            # Mixup on a fraction of batches. Regulariser on top of the sampler.
+            # Mixup or CutMix on a fraction of batches. When aug triggers,
+            # CUTMIX_PROB controls CutMix-vs-Mixup ratio.
             if MIXUP_ALPHA > 0 and np.random.rand() < MIXUP_PROB:
-                mixed_x, y_a, y_b, lam = mixup_batch(imgs, labels, alpha=MIXUP_ALPHA)
+                if CUTMIX_ALPHA > 0 and np.random.rand() < CUTMIX_PROB:
+                    mixed_x, y_a, y_b, lam = cutmix_batch(imgs, labels, alpha=CUTMIX_ALPHA)
+                else:
+                    mixed_x, y_a, y_b, lam = mixup_batch(imgs, labels, alpha=MIXUP_ALPHA)
                 logits = model(mixed_x)
                 loss   = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
             else:
@@ -864,9 +917,20 @@ def train_one_model(arch_key, train_loader, val_loader):
     model.load_state_dict(best_state)
     # One clean val pass on the best checkpoint — used for temperature scaling
     # and per-class threshold tuning in the ensemble step.
-    _, _, best_val_labels, best_val_probs, best_val_logits = _collect_val_outputs(
+    # Non-TTA pass is kept for logits (temperature scaling needs pre-softmax).
+    _, _, best_val_labels, _, best_val_logits = _collect_val_outputs(
         model, val_loader, criterion
     )
+    # TTA pass: matches test-time inference so calibration/α-tuning are
+    # aligned with the ensemble inputs. Fixes train/test distribution skew
+    # in val_probs observed in 2026-04-20_21-14.
+    model.eval()
+    all_probs_tta = []
+    with torch.no_grad():
+        for imgs, _, _, _ in val_loader:
+            imgs = imgs.to(DEVICE)
+            all_probs_tta.append(tta_predict(model, imgs).cpu().numpy())
+    best_val_probs = np.concatenate(all_probs_tta, axis=0)
     val_snapshot = {
         "labels": best_val_labels,
         "probs":  best_val_probs,
@@ -958,24 +1022,6 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 
-def tta_predict(model: nn.Module, imgs: torch.Tensor) -> torch.Tensor:
-    """5-view TTA: original + H-flip + V-flip + 90° rot + 180° rot.
-
-    Returns averaged softmax probabilities of shape (N, NUM_CLASSES).
-    """
-    views = [
-        imgs,
-        imgs.flip(-1),                        # horizontal flip
-        imgs.flip(-2),                        # vertical flip
-        torch.rot90(imgs, 1, [-2, -1]),       # 90°
-        torch.rot90(imgs, 2, [-2, -1]),       # 180°
-    ]
-    probs = torch.stack(
-        [torch.softmax(model(v), dim=1) for v in views]
-    )  # (5, N, C)
-    return probs.mean(0)                      # (N, C)
-
-
 test_results = {}   # arch_key → {preds, labels, probs, report}
 
 for arch_key, model in trained_models.items():
@@ -1010,7 +1056,10 @@ for arch_key, model in trained_models.items():
     torch.cuda.empty_cache()
 
 # ── Confusion matrices ───────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+_n = len(test_results)
+_ncols = min(2, _n)
+_nrows = (_n + _ncols - 1) // _ncols
+fig, axes = plt.subplots(_nrows, _ncols, figsize=(7 * _ncols, 5.5 * _nrows), squeeze=False)
 for ax, (arch_key, res) in zip(axes.flat, test_results.items()):
     cm = confusion_matrix(res["labels"], res["preds"])
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
@@ -1166,54 +1215,82 @@ for k in ARCHITECTURES:
     model_temperatures[k] = T
     print(f"  {k:20s}  temperature T={T:.3f}")
 
-# Weight each model by its val macro-F1 (what we optimised) rather than AUC.
+# ── Per-class ensemble weights ───────────────────────────────────────────────
+# Instead of one scalar weight per model, use a (K × C) matrix where W[k, c]
+# is proportional to model k's per-class F1 on val for class c. Each class
+# picks whichever models are most reliable for it. Columns sum to 1.
+val_labels_ref = val_snapshots[next(iter(ARCHITECTURES))]["labels"]
+_per_model_f1_by_class = {}
+for k in ARCHITECTURES:
+    preds_k = val_snapshots[k]["probs"].argmax(axis=1)
+    _per_model_f1_by_class[k] = f1_score(
+        val_labels_ref, preds_k, average=None, zero_division=0,
+        labels=list(range(NUM_CLASSES))
+    )
+_W = np.stack([_per_model_f1_by_class[k] for k in ARCHITECTURES])  # (K, C)
+_W = _W + 1e-6
+ENSEMBLE_WEIGHTS_PC = _W / _W.sum(axis=0, keepdims=True)  # per-class, sums to 1 per column
+
+# Also compute a scalar summary for logging / backward compat
 _val_f1s = {k: val_snapshots[k]["best_f1"] for k in ARCHITECTURES}
 _total   = sum(_val_f1s.values())
 ENSEMBLE_WEIGHTS = {k: v / _total for k, v in _val_f1s.items()}
-print("Val-tuned ensemble weights (by macro-F1):")
-for k, w in ENSEMBLE_WEIGHTS.items():
-    print(f"  {k:20s}  val_F1={_val_f1s[k]:.4f}  T={model_temperatures[k]:.3f}  weight={w:.4f}")
-assert abs(sum(ENSEMBLE_WEIGHTS.values()) - 1.0) < 1e-6, "Ensemble weights must sum to 1"
 
-# Temperature-scale each model's *test* probs before weighted averaging.
-# We only have post-TTA probs in test_results[k]["probs"] (not logits), so we
-# apply T in log-prob space — equivalent for calibration purposes.
+print("Per-class ensemble weights (row=model, col=class):")
+print("  " + "  ".join(f"{c:>6s}" for c in CLASS_NAMES))
+for i, k in enumerate(ARCHITECTURES):
+    row = "  ".join(f"{ENSEMBLE_WEIGHTS_PC[i, c]:6.3f}" for c in range(NUM_CLASSES))
+    print(f"  {k:20s} {row}  (val_F1={_val_f1s[k]:.4f}, T={model_temperatures[k]:.3f})")
+
+# Temperature-scale each model's *test* probs, then apply per-class weights.
 test_probs_cal = {
     k: apply_temperature(test_results[k]["probs"], model_temperatures[k], from_logits=False)
     for k in ARCHITECTURES
 }
-ensemble_probs = sum(ENSEMBLE_WEIGHTS[k] * test_probs_cal[k] for k in ARCHITECTURES)
+# Per-class weighted sum: probs[:, c] = Σ_k W[k,c] * probs_k[:, c]
+_keys = list(ARCHITECTURES)
+_P_test = np.stack([test_probs_cal[k] for k in _keys])  # (K, N, C)
+ensemble_probs = (ENSEMBLE_WEIGHTS_PC[:, None, :] * _P_test).sum(axis=0)
 
 # ── Per-class threshold tuning on val ────────────────────────────────────────
 # Default argmax often over-predicts the majority class (NV). For each class we
-# scale its column by a factor α_c chosen on val to maximise macro-F1. This is
-# equivalent to applying a per-class bias on log-probs before argmax.
+# scale its column by a factor α_c chosen on val. With per-class ensemble
+# weights applied first, α picks up residual bias not fixed by weighting.
 val_probs_cal = {
     k: apply_temperature(val_snapshots[k]["probs"], model_temperatures[k], from_logits=False)
     for k in ARCHITECTURES
 }
-val_ensemble_probs  = sum(ENSEMBLE_WEIGHTS[k] * val_probs_cal[k] for k in ARCHITECTURES)
-val_ensemble_labels = val_snapshots[next(iter(ARCHITECTURES))]["labels"]
+_P_val = np.stack([val_probs_cal[k] for k in _keys])
+val_ensemble_probs  = (ENSEMBLE_WEIGHTS_PC[:, None, :] * _P_val).sum(axis=0)
+val_ensemble_labels = val_labels_ref
 
 def tune_class_scales(probs: np.ndarray, labels: np.ndarray,
-                      grid=np.linspace(0.6, 1.6, 21)) -> np.ndarray:
-    """Coordinate search on α ∈ R^C (per-class multiplicative prior)."""
+                      grid=np.linspace(0.8, 1.5, 15)) -> np.ndarray:
+    """Coordinate search on α ∈ R^C (per-class multiplicative prior).
+
+    Objective: 0.5·macro-F1 + 0.5·balanced-accuracy. Pure macro-F1 tuning
+    over-suppressed minority classes (AKIEC, VASC) in 2026-04-20_21-14;
+    the bAcc term protects per-class recall. Grid clamped to [0.8, 1.5]
+    so minority classes cannot be aggressively demoted.
+    """
     C      = probs.shape[1]
     alpha  = np.ones(C)
     for _ in range(3):                                 # 3 sweeps is plenty
         for c in range(C):
-            best_f1, best_a = -1.0, alpha[c]
+            best_score, best_a = -1.0, alpha[c]
             for a in grid:
                 alpha[c] = a
                 preds    = (probs * alpha).argmax(axis=1)
                 f1       = f1_score(labels, preds, average="macro", zero_division=0)
-                if f1 > best_f1:
-                    best_f1, best_a = f1, a
+                bacc     = balanced_accuracy_score(labels, preds)
+                score    = 0.5 * f1 + 0.5 * bacc
+                if score > best_score:
+                    best_score, best_a = score, a
             alpha[c] = best_a
     return alpha
 
 class_scales = tune_class_scales(val_ensemble_probs, val_ensemble_labels)
-print("Per-class scales tuned on val (macro-F1):")
+print("Per-class scales tuned on val (0.5·macro-F1 + 0.5·bAcc, α∈[0.8,1.5]):")
 for c, s in zip(CLASS_NAMES, class_scales):
     print(f"  {c:8s}  α={s:.3f}")
 
@@ -1249,6 +1326,10 @@ plt.show()
 with open(os.path.join(OUT_ROOT, "metrics_ensemble.json"), "w") as _f:
     json.dump({
         "weights":       ENSEMBLE_WEIGHTS,
+        "weights_per_class": {
+            k: {c: float(ENSEMBLE_WEIGHTS_PC[i, j]) for j, c in enumerate(CLASS_NAMES)}
+            for i, k in enumerate(ARCHITECTURES)
+        },
         "temperatures":  model_temperatures,
         "class_scales":  {c: float(s) for c, s in zip(CLASS_NAMES, class_scales)},
         "balanced_accuracy": round(float(ensemble_bacc), 4),
@@ -1312,10 +1393,15 @@ with open(report_path, "w", encoding="utf-8") as _f:
     _f.write("Model temperatures:\n")
     for k, T in model_temperatures.items():
         _f.write(f"  {k:20s}  T={T:.3f}\n")
-    _f.write("Weights (by val macro-F1):\n")
+    _f.write("Scalar weights (by val macro-F1, informational):\n")
     for k, w in ENSEMBLE_WEIGHTS.items():
         _f.write(f"  {k:20s}  w={w:.4f}\n")
-    _f.write("Per-class prior scales α (tuned on val for macro-F1):\n")
+    _f.write("Per-class ensemble weights (row=model, col=class; columns sum to 1):\n")
+    _f.write("  " + " " * 22 + "  ".join(f"{c:>6s}" for c in CLASS_NAMES) + "\n")
+    for i, k in enumerate(ARCHITECTURES):
+        row = "  ".join(f"{ENSEMBLE_WEIGHTS_PC[i, j]:6.3f}" for j in range(NUM_CLASSES))
+        _f.write(f"  {k:20s}  {row}\n")
+    _f.write("Per-class prior scales α (tuned on val for 0.5·macro-F1 + 0.5·bAcc, α∈[0.8,1.5]):\n")
     for c, s in zip(CLASS_NAMES, class_scales):
         _f.write(f"  {c:8s}  α={s:.3f}\n")
     _f.write("\n")
