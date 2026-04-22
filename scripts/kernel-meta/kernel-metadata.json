@@ -1,6 +1,6 @@
 {
-  "id": "yehiasamir/isic2018-classifier-senet154",
-  "title": "ISIC2018 Classifier — SENet-154",
+  "id": "yehiasamir/isic2018-classifier-senet-154",
+  "title": "ISIC2018 Classifier SENet-154",
   "code_file": "../../ISIC2018_Classifier_Kaggle.ipynb",
   "language": "python",
   "kernel_type": "notebook",

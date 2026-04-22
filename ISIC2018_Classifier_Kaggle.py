@@ -69,11 +69,12 @@ IMG_RESIZE    = 300                  # paper: resize 300, crop 224
 IMG_CROP      = 224
 BATCH_SIZE    = 16                   # SENet-154 is 115M params; 32 risks OOM on T4
 ACCUM_STEPS   = 1                    # bump to 2 if OOM at batch=16
-MAX_EPOCHS    = 60  if not DEBUG else 3
-PATIENCE      = 10  if not DEBUG else 2
-MIN_DELTA     = 0.002
-LR            = 1e-4
-WEIGHT_DECAY  = 1e-4
+MAX_EPOCHS      = 80  if not DEBUG else 3
+PATIENCE        = 15  if not DEBUG else 2
+MIN_DELTA       = 0.002
+LR              = 1e-4
+WEIGHT_DECAY    = 1e-4
+COSINE_T_MAX    = 30  # LR completes a full descent by ep30; fine-tuning phase starts early
 NUM_CLASSES   = 7
 NUM_WORKERS   = 4 if KAGGLE else 0
 USE_AMP       = True
@@ -184,14 +185,20 @@ def apply_color_constancy(img: np.ndarray, power: int = 6) -> np.ndarray:
     return np.clip(img_float * scale, 0, 255).astype(np.uint8)
 
 
-# ── Class weights ───────────────────────────────────────────────────────────
+# ── Class weights (sqrt inverse-frequency) ─────────────────────────────────
+# Linear inv-freq gives a 59× NV:DF ratio → model oscillates violently each
+# epoch between minority-heavy and NV-heavy predictions.
+# Sqrt scaling brings the ratio to ~7.7×: still class-balanced, but stable.
+import math
 counts = Counter(train_df["label_idx"].values)
 total  = sum(counts.values())
-class_weights = {int(k): total / (NUM_CLASSES * v) for k, v in counts.items()}
+class_weights = {int(k): math.sqrt(total / (NUM_CLASSES * v))
+                 for k, v in counts.items()}
 with open(os.path.join(PREP_ROOT, "class_weights.json"), "w") as f:
     json.dump(class_weights, f, indent=2)
 
-print("Class weights (higher = rarer):")
+print("Class weights — sqrt(inv-freq) [max/min ratio: "
+      f"{max(class_weights.values())/min(class_weights.values()):.1f}×]:")
 for i, name in enumerate(CLASS_NAMES):
     print(f"  {name:6s} [{i}]: {class_weights.get(i, 0):.4f}")
 
@@ -362,7 +369,7 @@ def train_model():
     criterion = nn.CrossEntropyLoss(weight=w_tensor)
 
     optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=MAX_EPOCHS, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=COSINE_T_MAX, eta_min=1e-6)
     scaler    = GradScaler(enabled=USE_AMP)
 
     best_val_bacc    = -1.0
@@ -590,11 +597,11 @@ metadata = {
     "img_crop": IMG_CROP,
     "normalization_mean": data_stats["mean"],
     "normalization_std":  data_stats["std"],
-    "recipe": "paper-faithful-weighted-ce",
-    "loss": "CrossEntropyLoss(inverse-freq class weights)",
+    "recipe": "paper-faithful-weighted-ce-sqrt",
+    "loss": "CrossEntropyLoss(sqrt-inv-freq class weights)",
     "sampler": "random-shuffle",
     "optimizer": f"AdamW(lr={LR}, wd={WEIGHT_DECAY})",
-    "scheduler": f"CosineAnnealingLR(T_max={MAX_EPOCHS})",
+    "scheduler": f"CosineAnnealingLR(T_max={COSINE_T_MAX})",
     "batch_size": BATCH_SIZE,
     "accumulation_steps": ACCUM_STEPS,
     "use_amp": USE_AMP,
