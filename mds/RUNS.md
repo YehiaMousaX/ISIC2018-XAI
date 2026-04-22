@@ -1,188 +1,111 @@
 # Experiment Runs Log — ISIC 2018 Classifier
 
-Target: **bAcc ≥ 0.80 | top-1 ≥ 0.90 | macro-F1 ≥ 0.75 | macro-AUC ≥ 0.95**
+**Targets:** bAcc ≥ 0.80 | top-1 ≥ 0.90 | macro-F1 ≥ 0.75 | macro-AUC ≥ 0.95
 
 ---
 
-## Current notebook
+## Headline results
 
-**`ISIC2018_Classifier_Kaggle.py`** — Paper-faithful SENet-154 single-model classifier.
+| Run | Date | bAcc | top-1 | macro-F1 | macro-AUC | Epochs | Notes |
+|---|---|---|---|---|---|---|---|
+| **senet154-v3** (planned) | — | — | — | — | — | — | freeze-then-unfreeze + dropout + stronger WD |
+| senet154-v2-sqrt-weights | 2026-04-22 | 0.7570 | 0.8016 | 0.7297 | 0.9691 | 23 (best@8) | sqrt weights fixed top-1/F1; overfitting killed bAcc after ep8 |
+| senet154-v1-paper-faithful | 2026-04-21 | 0.7839 | 0.7474 | 0.6628 | 0.9608 | 17 (best@7) | best test bAcc so far; oscillation from 59× weight ratio |
 
-| Component | Value |
+---
+
+## Per-class recall — key runs (test set)
+
+| Run | MEL | NV | BCC | AKIEC | BKL | DF | VASC |
+|---|---|---|---|---|---|---|---|
+| senet154-v3 | — | — | — | — | — | — | — |
+| senet154-v2 | 0.795 | 0.823 | 0.742 | 0.512 | 0.797 | 0.773 | 0.857 |
+| senet154-v1 | 0.743 | 0.748 | 0.677 | 0.837 | 0.710 | 0.886 | 0.886 |
+
+---
+
+## Config diff — v1 → v2 → v3
+
+| Param | v1 | v2 | v3 (planned) |
+|---|---|---|---|
+| Class weights | linear inv-freq (59×) | sqrt inv-freq (7.7×) | sqrt inv-freq (keep) |
+| `COSINE_T_MAX` | 60 | 30 | 30 (keep) |
+| `PATIENCE` | 10 | 15 | 15 (keep) |
+| `MAX_EPOCHS` | 60 | 80 | 80 (keep) |
+| Backbone freeze | none | none | **freeze 5 ep, then unfreeze** |
+| Dropout | none | none | **drop_rate=0.3** |
+| Weight decay | 1e-4 | 1e-4 | **1e-3** |
+
+---
+
+## v2 diagnosis — why it regressed on bAcc despite better top-1/F1
+
+**What got better:** top-1 0.747→0.802, macro-F1 0.663→0.730, macro-AUC 0.961→0.969.
+The sqrt weights fixed the NV recall collapse (0.748→0.823) and balanced the class predictions.
+
+**What got worse:** test bAcc 0.784→0.757. Root cause: **overfitting.**
+
+| Signal | Evidence |
 |---|---|
-| Backbone | `legacy_senet154` (113M params), ImageNet-pretrained |
-| Input | Resize 300 → RandomCrop 224 (train) / CenterCrop 224 (eval) |
-| Color constancy | Shades-of-Gray, power=6 |
-| Loss | Class-weighted CrossEntropy (inverse-freq weights) |
-| Sampler | Standard random shuffle (no WeightedRandomSampler) |
-| Optimizer | AdamW lr=1e-4, wd=1e-4 + CosineAnnealingLR |
-| Batch | 16, AMP=True |
-| Early stop | patience=10 on val bAcc |
+| Train loss dropped 28× | ep1=0.977 → ep23=0.034 |
+| Val loss rose after ep8 | ep8=0.590 → ep23=0.788 |
+| Best val bAcc also at ep8 | peaked 0.811, then oscillated down to 0.750–0.784 |
+| Val-test gap widened | v1 gap=2.5pp → v2 gap=5.5pp |
 
-Legacy XAI pipeline archived to `legacy/`. XAI is a separate future notebook.
+113M-param SENet-154 is massively overparameterised for 8,750 training images (99 DF, 143 VASC). Without strong regularisation, the backbone memorises the training distribution by epoch 10 and generalisation collapses. The class-weighted loss amplifies minority gradients, accelerating this memorisation for the rarest classes.
+
+The same oscillation pattern appears in both runs (best checkpoint at epoch 7–8, then val bAcc falls despite val loss staying low), which confirms the issue is in the model, not the LR schedule.
 
 ---
 
-## All runs (newest first)
+## v2 epoch-by-epoch
 
----
-
-### 2026-04-21 — `senet154-paper-faithful` ← **current baseline**
-
-**Notebook:** `ISIC2018_Classifier_Kaggle.py` (fresh start)
-**Config:** SENet-154, weighted CE, 300→224, batch 16, AMP, patience 10 on val bAcc
-
-| Metric | Result | Target | Status |
-|---|---|---|---|
-| Balanced accuracy | 0.7839 | ≥ 0.80 | MISS |
-| Top-1 accuracy | 0.7474 | ≥ 0.90 | MISS |
-| Macro F1 | 0.6628 | ≥ 0.75 | MISS |
-| Macro AUC | 0.9608 | ≥ 0.95 | **PASS** |
-| Top-3 accuracy | 0.9603 | — | — |
-| Weighted F1 | 0.7657 | — | — |
-| MCC | 0.6384 | — | — |
-| Cohen κ | 0.6243 | — | — |
-
-**Training:** ran 17 epochs (best val bAcc=0.809 @ epoch 7, stopped after 17) | 64.6 min on T4
-
-**Per-class recall (test):**
-
-| MEL | NV | BCC | AKIEC | BKL | DF | VASC |
+| Ep | train loss | val loss | val bAcc | val top-1 | val F1 | LR |
 |---|---|---|---|---|---|---|
-| 0.743 | 0.748 | 0.677 | 0.837 | 0.710 | 0.886 | 0.886 |
-
-**What's good:**
-- Macro-AUC 0.961 — ranking quality is strong; model is discriminating classes well
-- Minority recall is high (AKIEC 0.84, DF 0.89, VASC 0.89) — class-weighted CE is doing its job on rare classes
-- Very fast convergence: 17 epochs total, best checkpoint at epoch 7
-- Training was clean: no overfitting signs (train loss 0.20, val loss 0.98 gap is from class weights, not overfitting)
-
-**What's bad:**
-- Top-1 accuracy 0.747 is the worst so far — model over-predicts minority classes at the expense of NV precision (NV recall dropped to 0.748 vs 0.94 in previous runs)
-- AKIEC precision 0.32 / DF precision 0.49 — many NV/BKL samples misclassified as rare classes
-- Val bAcc 0.809 vs test bAcc 0.784 — 2.5% gap suggests the val set was a slightly easier draw or early stopping under-trained the model
-- Stopped at epoch 17 — patience=10 from best at ep7 means model stopped improving early; possible the LR schedule (T_max=60) was too slow to cycle
-
-**Analysis:** The class-weighted CE without sampler heavily pushes the model to predict minority classes. High recall + low precision on AKIEC/DF/VASC is a classic over-correction. The paper may have relied on the full 5-fold CV + ensemble to average out this variance. A single run may need either a softer weight (reduce w_c for rarest classes) or a second run to see if it converges differently.
+| 1 | 0.9771 | 0.7213 | 0.6752 | 0.7778 | 0.5988 | 9.97e-05 |
+| 2 | 0.6957 | 0.7465 | 0.6979 | 0.7682 | 0.5942 | 9.89e-05 |
+| 3 | 0.5797 | 0.6444 | 0.7175 | 0.8141 | 0.6854 | 9.76e-05 |
+| 4 | 0.5096 | 0.6002 | 0.7362 | 0.8258 | 0.7146 | 9.57e-05 |
+| 5 | 0.4603 | 0.6330 | 0.7565 | 0.8285 | 0.7417 | 9.34e-05 |
+| 6 | 0.4030 | 0.6880 | 0.7444 | 0.8155 | 0.7026 | 9.05e-05 |
+| 7 | 0.3719 | 0.6020 | 0.7717 | 0.8292 | 0.7190 | 8.73e-05 |
+| **8** | **0.3444** | **0.5903** | **0.8106** ← best | **0.8134** | **0.7518** | **8.36e-05** |
+| 9 | 0.3047 | 0.6224 | 0.7568 | 0.8512 | 0.7551 | 7.96e-05 |
+| 10 | 0.2628 | 0.5897 | 0.7710 | 0.8505 | 0.7592 | 7.52e-05 |
+| 11 | 0.2250 | 0.6107 | 0.7825 | 0.8690 | 0.7740 | 7.06e-05 |
+| 12 | 0.1816 | 0.6109 | 0.7840 | 0.8560 | 0.7691 | 6.58e-05 |
+| 13 | 0.1923 | 0.7557 | 0.7636 | 0.8477 | 0.7442 | 6.08e-05 |
+| 14 | 0.1620 | 0.7318 | 0.7654 | 0.8416 | 0.7516 | 5.57e-05 |
+| 15 | 0.1295 | 0.7762 | 0.7545 | 0.8429 | 0.7352 | 5.05e-05 |
+| 16 | 0.1136 | 0.8133 | 0.7739 | 0.8608 | 0.7806 | 4.53e-05 |
+| 17 | 0.0907 | 0.8615 | 0.7480 | 0.8676 | 0.7643 | 4.02e-05 |
+| 18 | 0.0854 | 0.7318 | 0.7774 | 0.8539 | 0.7633 | 3.52e-05 |
+| 19 | 0.0673 | 0.8132 | 0.7535 | 0.8621 | 0.7546 | 3.04e-05 |
+| 20 | 0.0646 | 0.7705 | 0.7497 | 0.8628 | 0.7643 | 2.58e-05 |
+| 21 | 0.0485 | 0.8580 | 0.7626 | 0.8697 | 0.7727 | 2.14e-05 |
+| 22 | 0.0434 | 0.8312 | 0.7497 | 0.8628 | 0.7572 | 1.74e-05 |
+| 23 | 0.0343 | 0.7876 | 0.7696 | 0.8663 | 0.7698 | 1.37e-05 |
 
 ---
 
-### 2026-04-20_21-14 — `combo-a-cnn-only` (last XAI pipeline run)
+## v1 epoch-by-epoch
 
-**Notebook:** `XAI_Evaluation_Pipeline_Kaggle.py` (archived)
-**Config:** EffNet-B2 + DenseNet-121 | img256 | WD=5e-4, smooth=0.05, Mixup α=0.2 p=0.5 | WeightedRandomSampler | 15% lesion-grouped val | temp-scaled + per-class α ensemble
-
-| Model | bAcc | Top-1 | Macro F1 | Macro AUC | MCC |
-|---|---|---|---|---|---|
-| EfficientNet-B2 | 0.7052 | 0.8347 | 0.7390 | 0.9468 | 0.7171 |
-| DenseNet-121 | 0.7110 | 0.7824 | 0.7102 | 0.9503 | 0.6674 |
-| **Ensemble** | **0.6991** ⬇ | **0.8393** | **0.7377** | **0.9625** | **0.7290** |
-
-**Per-class recall (ensemble):**
-
-| MEL | NV | BCC | AKIEC | BKL | DF | VASC |
+| Ep | train loss | val loss | val bAcc | val top-1 | val F1 | LR |
 |---|---|---|---|---|---|---|
-| 0.696 | 0.927 | 0.807 | 0.419 | 0.747 | 0.727 | 0.571 |
-
-**Headline failure:** Ensemble bAcc *below* both individual models. Root cause: α-tuning objective was macro-F1, which actively suppressed AKIEC (α=0.65) and VASC (α=0.60) recall to optimise F1 at the expense of bAcc. Solo models had VASC recall 0.71–0.74; ensemble dropped it to 0.57.
-
----
-
-### 2026-04-20_13-57 — `img256 + smooth + mixup` (full run)
-
-**Config:** EffNet-B2 + DenseNet-121 | img256 | WD=5e-4, smooth=0.05, Mixup α=0.2 p=0.5
-
-| Model | bAcc | Top-1 | Macro F1 | Macro AUC |
-|---|---|---|---|---|
-| EfficientNet-B2 | 0.6866 | 0.8307 | 0.7356 | 0.9406 |
-| DenseNet-121 | 0.6997 | 0.8287 | — | — |
-
-EffNet ran 68 epochs (best val bAcc=0.851 @ some epoch) — large val/test gap, suggests val overfit or distribution shift between old (random) and new (lesion-grouped) val split.
-
----
-
-### 2026-04-20_08-08 — `effnet-b2 upgrade` (first B2 run)
-
-**Config:** EffNet-B2 + DenseNet-121 | img256 | switched from B0 to B2 backbone
-
-| Model | bAcc | Top-1 | Macro F1 | Macro AUC |
-|---|---|---|---|---|
-| EfficientNet-B2 | 0.6448 | 0.7809 | 0.6726 | — |
-| DenseNet-121 | 0.6389 | 0.7929 | 0.6815 | — |
-
-Lower bAcc than later runs — likely using old random val split (before lesion-grouped split was introduced). Top-1 accuracy on test was actually high (0.78–0.79) because NV dominated.
-
----
-
-### 2026-04-18_12-17 — `4-model second attempt`
-
-**Config:** EffNet-B0, DenseNet-121, ViT-Base, Swin-Tiny | 4-model XAI pipeline
-
-| Model | bAcc | Top-1 | Macro F1 |
-|---|---|---|---|
-| EfficientNet-B0 | 0.6678 | 0.7030 | 0.6396 |
-| DenseNet-121 | 0.6997 | 0.5904 | — |
-| ViT-Base | 0.6272 | 0.6217 | — |
-| Swin-Tiny | 0.7275 | 0.6543 | 0.7048 |
-
-Swin-Tiny best so far in this family at 0.7275.
-
----
-
-### 2026-04-17_03-34 — `4-model first full attempt`
-
-**Config:** EffNet-B0, DenseNet-121, ViT-Base, Swin-Tiny | first full non-debug 4-model run
-
-| Model | bAcc | Top-1 | Macro F1 |
-|---|---|---|---|
-| EfficientNet-B0 | 0.7082 | 0.6612 | 0.6503 |
-| DenseNet-121 | 0.7370 | 0.5742 | 0.5972 |
-| ViT-Base | 0.6678 | 0.5688 | 0.5224 |
-| Swin-Tiny | 0.7196 | 0.6386 | 0.6239 |
-
-Best single model to this date: DenseNet-121 at 0.737 bAcc.
-
----
-
-### 2026-04-16_00-14 — `first full run`
-
-**Config:** EffNet-B0, DenseNet-121, ViT-Base, Swin-Tiny | first non-debug full run
-
-| Model | bAcc | Top-1 |
-|---|---|---|
-| EfficientNet-B0 | 0.6961 | 0.5620 |
-| DenseNet-121 | 0.6935 | 0.4026 |
-| ViT-Base | 0.6403 | 0.4993 |
-| Swin-Tiny | 0.7002 | 0.4733 |
-
-High bAcc but very low top-1 accuracy — model was predicting minority classes aggressively (underfitting NV). First sign of the recall/precision trade-off.
-
----
-
-### 2026-04-15_22-02, 2026-04-16_00-03, 2026-04-20_12-56 — DEBUG runs
-
-All `DEBUG=True` (200–500 image subset, 3 epochs). Results are noise (0.25–0.44 bAcc). Excluded from trend analysis.
-
----
-
-## Trends
-
-| Pivot | bAcc (best single model) | Note |
-|---|---|---|
-| First full run (Apr 16) | 0.700 (Swin-Tiny) | 4-model, B0/DenseNet |
-| Second attempt (Apr 17) | 0.737 (DenseNet-121) | Better training |
-| After backbone upgrade B0→B2 (Apr 20) | 0.711 (DenseNet-121) | Lesion-grouped val split introduced — harder val |
-| SENet-154 paper-faithful (Apr 21) | **0.784** (single model) | New best test bAcc single model |
-
-**Best val bAcc ever:** 0.809 (SENet-154 @ epoch 7, Apr 21)
-
----
-
-## Next steps
-
-The SENet-154 run hit val bAcc 0.809 (above target) but test bAcc 0.784 (below). The gap and the over-prediction of minority classes suggest:
-
-1. **Soften class weights** — cap minority weights to avoid extreme over-prediction (e.g., `w_c = sqrt(N / (K * n_c))` instead of linear). Reduces AKIEC/DF false positives.
-2. **Increase patience** — current run stopped at epoch 7 + 10 = 17. Try `PATIENCE=15` or `MAX_EPOCHS=100` — SENet-154 may need more epochs to properly calibrate the NV/minority boundary.
-3. **Add PNASNet-5-Large** — the paper's full ensemble (SENet + PNASNet) gets 92.3% MCA. Even a simple weighted-average of two models would close the 0.784→0.80 gap on the test set.
-4. **Reduce LR** — try `LR=5e-5` with `T_max=60`; faster cosine cycle may explain early convergence stall.
+| 1 | 1.1801 | 0.9827 | 0.6948 | 0.6646 | 0.5264 | 9.99e-05 |
+| 2 | 0.8475 | 0.7804 | 0.7218 | 0.7051 | 0.5458 | 9.97e-05 |
+| 3 | 0.7129 | 0.6992 | 0.7330 | 0.7318 | 0.6285 | 9.94e-05 |
+| 4 | 0.6275 | 0.8220 | 0.7323 | 0.7942 | 0.6656 | 9.89e-05 |
+| 5 | 0.5640 | 0.7127 | 0.7392 | 0.7565 | 0.6585 | 9.83e-05 |
+| 6 | 0.5315 | 0.6754 | 0.7550 | 0.8011 | 0.6856 | 9.76e-05 |
+| **7** | **0.4774** | **0.6220** | **0.8089** ← best | **0.7668** | **0.6528** | **9.67e-05** |
+| 8 | 0.4710 | 0.7234 | 0.7700 | 0.7394 | 0.6793 | 9.57e-05 |
+| 9 | 0.4449 | 0.6680 | 0.7807 | 0.8381 | 0.7459 | 9.46e-05 |
+| 10 | 0.3731 | 0.8022 | 0.7866 | 0.7497 | 0.6975 | 9.34e-05 |
+| 11 | 0.3272 | 0.8469 | 0.7438 | 0.8532 | 0.7493 | 9.20e-05 |
+| 12 | 0.3067 | 0.7790 | 0.7412 | 0.8018 | 0.6820 | 9.05e-05 |
+| 13 | 0.3346 | 0.8449 | 0.7162 | 0.7956 | 0.6628 | 8.90e-05 |
+| 14 | 0.3053 | 0.9755 | 0.7469 | 0.8066 | 0.7071 | 8.73e-05 |
+| 15 | 0.2743 | 0.9667 | 0.7603 | 0.8086 | 0.7072 | 8.55e-05 |
+| 16 | 0.2622 | 0.6905 | 0.8028 | 0.8333 | 0.7657 | 8.36e-05 |
+| 17 | 0.2017 | 0.9837 | 0.7317 | 0.8416 | 0.7495 | 8.17e-05 |

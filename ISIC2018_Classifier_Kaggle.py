@@ -73,8 +73,11 @@ MAX_EPOCHS      = 80  if not DEBUG else 3
 PATIENCE        = 15  if not DEBUG else 2
 MIN_DELTA       = 0.002
 LR              = 1e-4
-WEIGHT_DECAY    = 1e-4
-COSINE_T_MAX    = 30  # LR completes a full descent by ep30; fine-tuning phase starts early
+LR_HEAD         = 1e-3   # head-only warm-up phase LR
+WEIGHT_DECAY    = 1e-3   # 10× stronger than v2; 113M params need real L2 on small dataset
+COSINE_T_MAX    = 30     # LR completes a full descent by ep30
+FREEZE_EPOCHS   = 5  if not DEBUG else 1   # freeze backbone, train head only first
+DROP_RATE       = 0.3    # timm dropout on classifier
 NUM_CLASSES   = 7
 NUM_WORKERS   = 4 if KAGGLE else 0
 USE_AMP       = True
@@ -308,11 +311,12 @@ print(f"Pixel range : [{imgs.min():.3f}, {imgs.max():.3f}]")
 
 # %%
 def create_senet154():
-    """Create SENet-154 with 7-class head. Falls back across timm name variants."""
+    """Create SENet-154 with 7-class head + dropout. Falls back across timm name variants."""
     for name in (BACKBONE, "senet154"):
         try:
             model = timm.create_model(name, pretrained=True,
-                                      num_classes=NUM_CLASSES)
+                                      num_classes=NUM_CLASSES,
+                                      drop_rate=DROP_RATE)
             resolved = name
             break
         except Exception as e:
@@ -362,95 +366,134 @@ def evaluate(model, loader, criterion):
             np.array(all_preds), np.array(all_labels), np.array(all_probs))
 
 
-def train_model():
-    # Paper-faithful: class-weighted CE, no focal, no label smoothing.
-    w_tensor = torch.tensor([class_weights[i] for i in range(NUM_CLASSES)],
-                            dtype=torch.float32, device=DEVICE)
-    criterion = nn.CrossEntropyLoss(weight=w_tensor)
+def _run_epoch(loader, criterion, optimizer, scaler, epoch_label, train=True):
+    """One train or eval pass. Returns (loss, preds, labels, probs)."""
+    if train:
+        model.train()
+        running_loss, n = 0.0, 0
+        optimizer.zero_grad()
+        bar = tqdm(loader, desc=epoch_label, leave=False, unit="batch")
+        for step, (imgs, labels) in enumerate(bar):
+            imgs   = imgs.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+            with autocast(enabled=USE_AMP):
+                loss = criterion(model(imgs), labels) / ACCUM_STEPS
+            scaler.scale(loss).backward()
+            if (step + 1) % ACCUM_STEPS == 0:
+                scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
+            running_loss += loss.item() * imgs.size(0) * ACCUM_STEPS
+            n            += imgs.size(0)
+            bar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
+        return running_loss / max(n, 1), None, None, None
+    else:
+        return evaluate(model, loader, criterion)
 
-    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=COSINE_T_MAX, eta_min=1e-6)
+
+def train_model():
+    w_tensor  = torch.tensor([class_weights[i] for i in range(NUM_CLASSES)],
+                             dtype=torch.float32, device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=w_tensor)
     scaler    = GradScaler(enabled=USE_AMP)
+
+    history = {"train_loss": [], "val_loss": [], "val_bacc": [], "val_top1": [],
+               "val_auc": [], "val_f1_macro": [], "val_per_class_recall": [],
+               "lr": [], "stage": []}
 
     best_val_bacc    = -1.0
     best_state       = None
     best_epoch       = 0
     patience_counter = 0
-    history = {"train_loss": [], "val_loss": [], "val_bacc": [], "val_top1": [],
-               "val_auc": [], "val_f1_macro": [], "val_per_class_recall": [],
-               "lr": []}
+    t_start          = time.time()
+    global_epoch     = 0
 
-    t_start = time.time()
-    for epoch in range(MAX_EPOCHS):
-        # ── Train ──────────────────────────────────────────────────────────
-        model.train()
-        running_loss, n = 0.0, 0
-        optimizer.zero_grad()
-        bar = tqdm(train_loader, desc=f"Ep {epoch+1:02d}/{MAX_EPOCHS} train",
-                   leave=False, unit="batch")
-        for step, (imgs, labels) in enumerate(bar):
-            imgs   = imgs.to(DEVICE, non_blocking=True)
-            labels = labels.to(DEVICE, non_blocking=True)
+    # ── Stage 1: freeze backbone, warm up head only ─────────────────────────
+    print(f"\n{'='*60}\n  Stage 1 — head warm-up ({FREEZE_EPOCHS} epochs, LR={LR_HEAD})\n{'='*60}")
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in model.get_classifier().parameters():
+        param.requires_grad = True
 
-            with autocast(enabled=USE_AMP):
-                logits = model(imgs)
-                loss   = criterion(logits, labels) / ACCUM_STEPS
+    head_optimizer = AdamW(model.get_classifier().parameters(),
+                           lr=LR_HEAD, weight_decay=WEIGHT_DECAY)
 
-            scaler.scale(loss).backward()
-            if (step + 1) % ACCUM_STEPS == 0:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-            running_loss += loss.item() * imgs.size(0) * ACCUM_STEPS
-            n            += imgs.size(0)
-            bar.set_postfix(loss=f"{loss.item() * ACCUM_STEPS:.4f}")
-        train_loss = running_loss / max(n, 1)
-
-        # ── Validate ───────────────────────────────────────────────────────
+    for ep in range(FREEZE_EPOCHS):
+        global_epoch += 1
+        label = f"Ep {global_epoch:02d} [frozen]"
+        train_loss, _, _, _ = _run_epoch(train_loader, criterion, head_optimizer,
+                                         scaler, label, train=True)
         val_loss, val_preds, val_labels, val_probs = evaluate(model, val_loader, criterion)
+
         val_bacc = balanced_accuracy_score(val_labels, val_preds)
         val_top1 = accuracy_score(val_labels, val_preds)
         try:
             val_auc = roc_auc_score(val_labels, val_probs, multi_class="ovr", average="macro")
         except ValueError:
-            val_auc = float("nan")   # can fail early if some class absent in val preds
-        val_f1   = f1_score(val_labels, val_preds, average="macro", zero_division=0)
-        per_rec  = recall_score(val_labels, val_preds, average=None,
-                                zero_division=0, labels=list(range(NUM_CLASSES))).tolist()
+            val_auc = float("nan")
+        val_f1  = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        per_rec = recall_score(val_labels, val_preds, average=None,
+                               zero_division=0, labels=list(range(NUM_CLASSES))).tolist()
+
+        history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
+        history["val_bacc"].append(val_bacc);     history["val_top1"].append(val_top1)
+        history["val_auc"].append(val_auc);       history["val_f1_macro"].append(val_f1)
+        history["val_per_class_recall"].append(per_rec)
+        history["lr"].append(LR_HEAD);            history["stage"].append("frozen")
+
+        rec_str = "  ".join(f"{n}={r:.2f}" for n, r in zip(CLASS_NAMES, per_rec))
+        print(f"[frozen] Ep {global_epoch:02d} | train={train_loss:.4f} | val={val_loss:.4f}"
+              f" | top1={val_top1:.4f} | bAcc={val_bacc:.4f} | F1={val_f1:.4f}", flush=True)
+        print(f"    per-class recall: {rec_str}", flush=True)
+
+    # ── Stage 2: unfreeze all, cosine LR, early stopping ───────────────────
+    print(f"\n{'='*60}\n  Stage 2 — full fine-tune (LR={LR}, WD={WEIGHT_DECAY})\n{'='*60}")
+    for param in model.parameters():
+        param.requires_grad = True
+
+    optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=COSINE_T_MAX, eta_min=1e-6)
+
+    for ep in range(MAX_EPOCHS):
+        global_epoch += 1
+        label = f"Ep {global_epoch:02d}/{FREEZE_EPOCHS + MAX_EPOCHS} train"
+        train_loss, _, _, _ = _run_epoch(train_loader, criterion, optimizer,
+                                         scaler, label, train=True)
+        val_loss, val_preds, val_labels, val_probs = evaluate(model, val_loader, criterion)
+
+        val_bacc = balanced_accuracy_score(val_labels, val_preds)
+        val_top1 = accuracy_score(val_labels, val_preds)
+        try:
+            val_auc = roc_auc_score(val_labels, val_probs, multi_class="ovr", average="macro")
+        except ValueError:
+            val_auc = float("nan")
+        val_f1  = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        per_rec = recall_score(val_labels, val_preds, average=None,
+                               zero_division=0, labels=list(range(NUM_CLASSES))).tolist()
 
         scheduler.step()
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["val_bacc"].append(val_bacc)
-        history["val_top1"].append(val_top1)
-        history["val_auc"].append(val_auc)
-        history["val_f1_macro"].append(val_f1)
+        history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
+        history["val_bacc"].append(val_bacc);     history["val_top1"].append(val_top1)
+        history["val_auc"].append(val_auc);       history["val_f1_macro"].append(val_f1)
         history["val_per_class_recall"].append(per_rec)
         history["lr"].append(optimizer.param_groups[0]["lr"])
+        history["stage"].append("unfrozen")
 
         rec_str = "  ".join(f"{n}={r:.2f}" for n, r in zip(CLASS_NAMES, per_rec))
-        print(
-            f"[{resolved_name}] Ep {epoch+1:02d}/{MAX_EPOCHS}"
-            f" | train={train_loss:.4f} | val={val_loss:.4f}"
-            f" | top1={val_top1:.4f} | bAcc={val_bacc:.4f}"
-            f" | F1={val_f1:.4f} | AUC={val_auc:.4f}",
-            flush=True,
-        )
+        print(f"[{resolved_name}] Ep {global_epoch:02d} | train={train_loss:.4f}"
+              f" | val={val_loss:.4f} | top1={val_top1:.4f} | bAcc={val_bacc:.4f}"
+              f" | F1={val_f1:.4f} | AUC={val_auc:.4f}", flush=True)
         print(f"    per-class recall: {rec_str}", flush=True)
 
-        # Early-stop on val bAcc (the target metric)
         if val_bacc > best_val_bacc + MIN_DELTA:
             best_val_bacc    = val_bacc
-            best_epoch       = epoch + 1
+            best_epoch       = global_epoch
             best_state       = copy.deepcopy(model.state_dict())
             patience_counter = 0
             print(f"    ✓ new best val bAcc={best_val_bacc:.4f} @ epoch {best_epoch}", flush=True)
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                print(f"    Early stopping at epoch {epoch+1} "
+                print(f"    Early stopping at epoch {global_epoch} "
                       f"(no val-bAcc improvement for {PATIENCE} epochs)", flush=True)
                 break
 
